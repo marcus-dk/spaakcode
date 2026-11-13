@@ -6,6 +6,7 @@ import * as Schema from "effect/Schema";
 import { Command, GlobalFlag } from "effect/cli";
 import * as CliError from "effect/cli/CliError";
 
+import * as CentralState from "../centralState/CentralState.ts";
 import { awaitServiceLauncherStop } from "../cloud/serviceLauncherClient.ts";
 import * as ServerConfig from "../config.ts";
 import { awaitLauncherLoss } from "../launcherWatch.ts";
@@ -39,6 +40,7 @@ const runServerCommand = Effect.fn("server.runServerCommand")(function* (
         Effect.provide(DatabaseMaintenance.layer),
       ),
     ),
+    CentralState.supervise(config),
   );
   if (config.mode !== "desktop" || config.desktopBootstrapToken === undefined) return yield* run;
   return yield* Effect.raceFirst(

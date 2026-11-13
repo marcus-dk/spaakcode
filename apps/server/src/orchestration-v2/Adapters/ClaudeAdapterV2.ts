@@ -13096,7 +13096,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           // Any message in any transcript copy means Claude may still resume it.
           let found = false;
           let unreadable = false;
-          for (const project of yield* fileSystem.readDirectory(projectsDir)) {
+          for (const project of yield* fileSystem
+            .readDirectory(projectsDir)
+            .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed([])))) {
             const transcriptPath = path.join(projectsDir, project, `${nativeThreadId}.jsonl`);
             // Stray files beside the project dirs fail with ENOTDIR.
             if (
@@ -13122,7 +13124,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             }
             found = true;
           }
-          return found && !unreadable ? ("empty" as const) : ("missing" as const);
+          return unreadable
+            ? ("missing" as const)
+            : found
+              ? ("empty" as const)
+              : ("absent" as const);
         });
 
         const runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime = {
@@ -13223,7 +13229,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 const transcript = yield* claudeTranscriptState(nativeThreadId).pipe(
                   Effect.orElseSucceed(() => "missing" as const),
                 );
-                if (transcript === "empty") {
+                if (
+                  transcript === "empty" ||
+                  (transcript === "absent" && threadInput.providerThread.lastRunOrdinal !== null)
+                ) {
                   return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                     driver: CLAUDE_PROVIDER,
                     detail: `Claude session ${nativeThreadId} has no conversation to resume.`,

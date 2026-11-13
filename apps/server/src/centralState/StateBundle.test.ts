@@ -1,0 +1,755 @@
+// @effect-diagnostics nodeBuiltinImport:off - seeds T3 homes and inspects restored databases directly.
+import * as NodeFS from "node:fs";
+import * as NodeSqlite from "node:sqlite";
+
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { assert, it } from "@effect/vitest";
+import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
+import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
+import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+
+import { BUILD_MIGRATION_HEAD } from "../persistence/databaseMigrationHead.ts";
+import { runMigrations } from "../persistence/Migrations.ts";
+import * as SqlitePersistence from "../persistence/Sqlite.ts";
+import type { HeldLease, LeaseLoss } from "./CentralLease.ts";
+import * as CentralObjectStore from "./CentralObjectStore.ts";
+import { RESTORE_SEQUENCE_JUMP } from "./DatabaseSnapshot.ts";
+import * as Manifest from "./Manifest.ts";
+import * as StateBundle from "./StateBundle.ts";
+
+const homeKey = "dev";
+const occurredAt = "2026-09-03T00:00:00.000Z";
+const attachmentId = "thread-0a0a0a0a-0000-4000-8000-000000000001";
+const pendingId = "pending-0a0a0a0a-0000-4000-8000-000000000002";
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+
+const noClaude: StateBundle.ClaudeHooks = {
+  collect: () => Effect.succeed({ files: {} }),
+  stage: () => Effect.succeed({ place: Effect.void }),
+};
+
+const SYNCED = [
+  "environment-id",
+  "settings.json",
+  "secrets/server-signing-key.bin",
+  "secrets/files/x",
+  `attachments/${attachmentId}.png`,
+];
+const EXCLUDED = [
+  "secrets/dpop-proof-y.bin",
+  "secrets/z.bin.0a0a0a0a-0000-4000-8000-000000000003.tmp",
+  `attachments/${pendingId}.png`,
+  "attachments/upload.part",
+];
+
+const makeLease = (headSequence: number | null = null) =>
+  Effect.gen(function* () {
+    const lease: HeldLease = {
+      holderId: "lease",
+      previous:
+        headSequence === null
+          ? Option.none()
+          : Option.some({
+              formatVersion: 1,
+              homeKey,
+              holder: null,
+              renewedAt: occurredAt,
+              headSequence,
+              takeoverRequest: null,
+              writeNonce: "previous",
+            }),
+      lost: yield* Deferred.make<LeaseLoss>(),
+      handoffRequested: yield* Deferred.make<{ readonly host: string; readonly pid: number }>(),
+      release: Effect.void,
+    };
+    return lease;
+  });
+
+/** A filesystem store whose downloads, writes and removes are counted. */
+const setup = Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-state-bundle-" });
+  const inner = Context.get(
+    yield* Layer.build(CentralObjectStore.layerFilesystem(path.join(directory, "store"))),
+    CentralObjectStore.CentralObjectStore,
+  );
+  const counts = { downloads: 0, removes: [] as Array<string> };
+  const store = CentralObjectStore.CentralObjectStore.of({
+    read: inner.read,
+    download: (key, destination) =>
+      Effect.suspend(() => {
+        counts.downloads += 1;
+        return inner.download(key, destination);
+      }),
+    write: inner.write,
+    remove: (key) =>
+      Effect.suspend(() => {
+        counts.removes.push(key);
+        return inner.remove(key);
+      }),
+  });
+  const root = path.join(directory, "home");
+  const stateDir = path.join(root, "userdata");
+  const context = (holderId: string): StateBundle.BundleContext => ({
+    homeKey,
+    holder: { holderId, host: "test-host", pid: 1, bootId: null, stateDir },
+    buildVersion: "0.0.0-test",
+    paths: {
+      baseDir: root,
+      stateDir,
+      dbPath: path.join(stateDir, "statev2.sqlite"),
+      attachmentsDir: path.join(stateDir, "attachments"),
+      claudeHome: path.join(root, "claude"),
+      workDir: path.join(stateDir, "central-state"),
+    },
+  });
+  const file = (relativePath: string) => path.join(stateDir, ...relativePath.split("/"));
+  let mtime = 1_800_000_000;
+  /** Whole seconds, so every write gets a distinct mtime the scan cache notices. */
+  const write = (relativePath: string, contents: string) => {
+    NodeFS.mkdirSync(path.dirname(file(relativePath)), { recursive: true });
+    NodeFS.writeFileSync(file(relativePath), contents);
+    mtime += 1;
+    NodeFS.utimesSync(file(relativePath), mtime, mtime);
+  };
+  const read = (relativePath: string) =>
+    NodeFS.existsSync(file(relativePath)) ? NodeFS.readFileSync(file(relativePath), "utf8") : null;
+  const run = <A, E>(
+    effect: Effect.Effect<
+      A,
+      E,
+      CentralObjectStore.CentralObjectStore | FileSystem.FileSystem | Path.Path
+    >,
+  ) => effect.pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, store));
+  const wipe = () => NodeFS.rmSync(root, { recursive: true, force: true });
+  const blobExists = (sha256: string) =>
+    run(store.read(Manifest.keys.blob(homeKey, sha256))).pipe(Effect.map(Option.isSome));
+  const objectExists = (key: string) => run(store.read(key)).pipe(Effect.map(Option.isSome));
+  const head = () => run(Manifest.readHead(homeKey)).pipe(Effect.map(Option.getOrThrow));
+  return { store, counts, context, file, write, read, run, wipe, blobExists, objectExists, head };
+});
+type Fixture = Effect.Success<typeof setup>;
+
+const withDatabase = <A, E>(fixture: Fixture, effect: Effect.Effect<A, E, SqlClient.SqlClient>) =>
+  Effect.gen(function* () {
+    const { dbPath, stateDir } = fixture.context("seed").paths;
+    NodeFS.mkdirSync(stateDir, { recursive: true });
+    return yield* effect.pipe(Effect.provide(Layer.fresh(SqlitePersistence.layerFromPath(dbPath))));
+  });
+
+const insertEvent = (ordinal: number) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`INSERT INTO orchestration_events ${sql.insert({
+      event_id: `event:${ordinal}`,
+      aggregate_kind: "thread",
+      stream_id: "thread-a",
+      stream_version: ordinal,
+      event_type: "provider-session.detached",
+      occurred_at: occurredAt,
+      command_id: null,
+      causation_event_id: null,
+      correlation_id: null,
+      actor_kind: "server",
+      payload_json: encodeJson({ providerSessionId: `session:${ordinal}`, detachedAt: occurredAt }),
+      metadata_json: "{}",
+      application_event_version: 2,
+    })}`;
+  });
+
+const seedDatabase = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  yield* sql`
+    INSERT INTO orchestration_v2_projection_threads
+      (thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
+       created_at, updated_at, payload_json)
+    VALUES ('thread-a', 'project-a', 'Thread A', 'codex', 'full-access', 'default',
+      ${occurredAt}, ${occurredAt}, '{}')
+  `;
+  yield* sql`
+    INSERT INTO orchestration_v2_projection_messages
+      (message_id, thread_id, role, streaming, created_at, updated_at, payload_json)
+    VALUES ('message-a', 'thread-a', 'user', 0, ${occurredAt}, ${occurredAt},
+      ${JSON.stringify({ text: "the needle message", createdBy: "user" })})
+  `;
+  yield* Effect.forEach([1, 2, 3], insertEvent, { discard: true });
+});
+
+const seedHome = (fixture: Fixture) =>
+  Effect.gen(function* () {
+    yield* withDatabase(fixture, seedDatabase);
+    fixture.write("environment-id", "environment-a");
+    fixture.write("settings.json", '{"theme":"dark"}');
+    fixture.write("secrets/server-signing-key.bin", "signing-key");
+    fixture.write("secrets/files/x", "nested secret");
+    fixture.write(`attachments/${attachmentId}.png`, "png bytes");
+    for (const relativePath of EXCLUDED) fixture.write(relativePath, "excluded");
+  });
+
+const prepare = (fixture: Fixture, holderId: string, claude = noClaude, headSequence?: number) =>
+  Effect.gen(function* () {
+    const lease = yield* makeLease(headSequence ?? null);
+    return yield* fixture.run(
+      StateBundle.prepareHome({ ctx: fixture.context(holderId), lease, claude }),
+    );
+  });
+
+const pushClosed = (
+  fixture: Fixture,
+  holderId: string,
+  committed: StateBundle.Committed,
+  cache: StateBundle.PushCache,
+) =>
+  fixture.run(
+    StateBundle.push({
+      ctx: fixture.context(holderId),
+      committed,
+      cache,
+      source: { _tag: "Closed" },
+      claude: noClaude,
+    }),
+  );
+
+const committedOf = (outcome: StateBundle.PushOutcome) => {
+  assert.strictEqual(outcome._tag, "Committed");
+  if (outcome._tag !== "Committed") throw new Error("expected a commit");
+  return outcome.committed;
+};
+
+const refsOf = (manifest: Manifest.Manifest) => [
+  ...(manifest.database === null ? [] : [manifest.database.blob.sha256]),
+  ...Object.values(manifest.files).map((entry) => entry.blob.sha256),
+];
+
+const assertRefsPresent = (fixture: Fixture, manifest: Manifest.Manifest) =>
+  Effect.forEach(refsOf(manifest), (sha256) =>
+    fixture.blobExists(sha256).pipe(Effect.map((exists) => assert.isTrue(exists, sha256))),
+  );
+
+const openDatabase = (fixture: Fixture) =>
+  new NodeSqlite.DatabaseSync(fixture.context("inspect").paths.dbPath, { readOnly: true });
+
+const manifestWith = (fields: {
+  readonly epoch: string;
+  readonly generation: number;
+  readonly committedBy: string | null;
+  readonly database: boolean;
+}): Manifest.Manifest => ({
+  formatVersion: 1,
+  minReaderVersion: 1,
+  homeKey,
+  epoch: fields.epoch,
+  generation: fields.generation,
+  holder: { holderId: "holder", host: "host", pid: 1, bootId: null, stateDir: "/state" },
+  committedBy: fields.committedBy,
+  committedAt: null,
+  buildVersion: "0.0.0-test",
+  paths: { baseDir: "/base", stateDir: "/state", claudeHome: "/claude" },
+  sequenceFloor: 0,
+  database: fields.database
+    ? { blob: { sha256: "db", size: 1, encoding: "zstd" }, migrations: [], maxSequence: 0 }
+    : null,
+  files: {},
+  claude: { files: {} },
+  history: [],
+  pinned: [],
+  writeNonce: "nonce",
+});
+
+it("decideMode", () => {
+  const committed = manifestWith({
+    epoch: "e1",
+    generation: 4,
+    committedBy: "a",
+    database: true,
+  });
+  const empty = manifestWith({ epoch: "e1", generation: 0, committedBy: null, database: false });
+  const marker = (fields: { epoch: string; generation: number; holderId: string; key?: string }) =>
+    Option.some({
+      formatVersion: 1 as const,
+      homeKey: fields.key ?? homeKey,
+      epoch: fields.epoch,
+      generation: fields.generation,
+      holderId: fields.holderId,
+    });
+  const rows = [
+    {
+      name: "a different home key",
+      head: Option.some(committed),
+      marker: marker({ epoch: "e1", generation: 4, holderId: "a", key: "other" }),
+      localDbExists: true,
+      expected: { _tag: "KeyMismatch", enrolledKey: "other" },
+    },
+    {
+      name: "no head, no local db",
+      head: Option.none(),
+      marker: Option.none(),
+      localDbExists: false,
+      expected: "fresh",
+    },
+    {
+      name: "empty head, no local db",
+      head: Option.some(empty),
+      marker: Option.none(),
+      localDbExists: false,
+      expected: "fresh",
+    },
+    {
+      name: "no head, local db",
+      head: Option.none(),
+      marker: Option.none(),
+      localDbExists: true,
+      expected: "adopt",
+    },
+    {
+      name: "empty head, local db",
+      head: Option.some(empty),
+      marker: marker({ epoch: "e1", generation: 0, holderId: "a" }),
+      localDbExists: true,
+      expected: "adopt",
+    },
+    {
+      name: "same epoch and generation",
+      head: Option.some(committed),
+      marker: marker({ epoch: "e1", generation: 4, holderId: "b" }),
+      localDbExists: true,
+      expected: "keep",
+    },
+    {
+      name: "stale generation, but this home committed the head",
+      head: Option.some(committed),
+      marker: marker({ epoch: "e1", generation: 3, holderId: "a" }),
+      localDbExists: true,
+      expected: "keep",
+    },
+    {
+      name: "stale generation from another holder",
+      head: Option.some(committed),
+      marker: marker({ epoch: "e1", generation: 3, holderId: "b" }),
+      localDbExists: true,
+      expected: "restore",
+    },
+    {
+      name: "epoch mismatch",
+      head: Option.some(committed),
+      marker: marker({ epoch: "e0", generation: 4, holderId: "a" }),
+      localDbExists: true,
+      expected: "restore",
+    },
+    {
+      name: "local db without a marker",
+      head: Option.some(committed),
+      marker: Option.none(),
+      localDbExists: true,
+      expected: "restore",
+    },
+    {
+      name: "matching marker without a local db",
+      head: Option.some(committed),
+      marker: marker({ epoch: "e1", generation: 4, holderId: "a" }),
+      localDbExists: false,
+      expected: "restore",
+    },
+  ] as const;
+  for (const row of rows) {
+    const decided = StateBundle.decideMode({
+      homeKey,
+      head: row.head,
+      marker: row.marker,
+      localDbExists: row.localDbExists,
+    });
+    assert.deepStrictEqual(
+      decided,
+      typeof row.expected === "string" ? { _tag: "Mode", mode: row.expected } : row.expected,
+      row.name,
+    );
+  }
+});
+
+it.layer(NodeServices.layer)("StateBundle", (it) => {
+  it.effect("restores an adopted home on an empty pod", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      const adopted = yield* prepare(fixture, "holder-a");
+      assert.strictEqual(adopted.mode, "adopt");
+      assert.strictEqual(adopted.committed.manifest.generation, 1);
+      assert.isNotNull(adopted.committed.manifest.database);
+
+      fixture.write("settings.json", '{"theme":"light"}');
+      const second = committedOf(
+        yield* pushClosed(fixture, "holder-a", adopted.committed, adopted.cache),
+      );
+      assert.strictEqual(second.manifest.generation, 2);
+      assert.deepStrictEqual(Object.keys(second.manifest.files).sort(), [...SYNCED].sort());
+      const expected = Object.fromEntries(SYNCED.map((file) => [file, fixture.read(file)]));
+      const database = second.manifest.database!;
+
+      fixture.wipe();
+      const restored = yield* prepare(fixture, "holder-b");
+      assert.strictEqual(restored.mode, "restore");
+      const manifest = restored.committed.manifest;
+
+      for (const file of SYNCED) assert.strictEqual(fixture.read(file), expected[file], file);
+      for (const file of EXCLUDED) assert.isNull(fixture.read(file), file);
+      assert.strictEqual(NodeFS.statSync(fixture.file("secrets")).mode & 0o777, 0o700);
+      for (const file of SYNCED.filter((name) => name.startsWith("secrets/"))) {
+        assert.strictEqual(NodeFS.statSync(fixture.file(file)).mode & 0o777, 0o600, file);
+      }
+      for (const file of SYNCED) {
+        assert.strictEqual(
+          NodeFS.statSync(fixture.file(file)).mtimeMs,
+          manifest.files[file]?.mtimeMs,
+          file,
+        );
+      }
+
+      const floor = database.maxSequence + RESTORE_SEQUENCE_JUMP;
+      assert.strictEqual(manifest.sequenceFloor, floor);
+      assert.notStrictEqual(manifest.epoch, second.manifest.epoch);
+      const db = openDatabase(fixture);
+      try {
+        assert.strictEqual(db.prepare("PRAGMA quick_check").get()?.quick_check, "ok");
+        assert.strictEqual(
+          db.prepare("SELECT title FROM orchestration_v2_projection_threads").get()?.title,
+          "Thread A",
+        );
+        const found = db
+          .prepare(
+            `SELECT messages.message_id FROM orchestration_v2_message_search AS search
+             INNER JOIN orchestration_v2_projection_messages AS messages ON messages.rowid = search.rowid
+             WHERE orchestration_v2_message_search MATCH '"needle"'`,
+          )
+          .all();
+        assert.deepStrictEqual(
+          found.map((row) => row.message_id),
+          ["message-a"],
+        );
+        assert.strictEqual(
+          db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'orchestration_events'").get()
+            ?.seq,
+          floor - 1,
+        );
+      } finally {
+        db.close();
+      }
+      const marker = yield* Manifest.readMarker(fixture.context("b").paths.stateDir);
+      assert.strictEqual(Option.getOrThrow(marker).epoch, manifest.epoch);
+
+      // The floored database is new content; the restored files, with their mtimes, are not.
+      const floored = committedOf(
+        yield* pushClosed(fixture, "holder-b", restored.committed, restored.cache),
+      );
+      assert.deepStrictEqual(floored.manifest.files, manifest.files);
+      assert.notStrictEqual(floored.manifest.database?.blob.sha256, database.blob.sha256);
+      const again = yield* pushClosed(fixture, "holder-b", floored, restored.cache);
+      assert.strictEqual(again._tag, "Unchanged");
+    }),
+  );
+
+  it.effect("refuses a head it cannot restore before moving anything aside", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      const adopted = yield* prepare(fixture, "holder-a");
+      const good = adopted.committed.manifest;
+      const database = good.database!;
+
+      fixture.wipe();
+      fixture.write("settings.json", "local");
+      const markerBefore = {
+        formatVersion: 1 as const,
+        homeKey,
+        epoch: "stale",
+        generation: 0,
+        holderId: "old",
+      };
+      const { stateDir, workDir } = fixture.context("b").paths;
+      yield* Manifest.writeMarker(stateDir, markerBefore);
+      const headKey = Manifest.keys.head(homeKey);
+      const dbBlobKey = Manifest.keys.blob(homeKey, database.blob.sha256);
+      const setHead = (manifest: object) =>
+        fixture.run(
+          fixture.store.write(
+            headKey,
+            { _tag: "Bytes", bytes: new TextEncoder().encode(JSON.stringify(manifest)) },
+            { _tag: "None" },
+          ),
+        );
+
+      const rows = [
+        {
+          error: "CentralStateMigrationRefusedError",
+          prepare: setHead({
+            ...good,
+            database: {
+              ...database,
+              migrations: [
+                ...database.migrations,
+                { id: BUILD_MIGRATION_HEAD + 1, name: "FromTheFuture" },
+              ],
+            },
+          }),
+          downloads: 0,
+        },
+        ...(["baseDir", "stateDir", "claudeHome"] as const).map((field) => ({
+          error: "CentralStatePathMismatchError",
+          prepare: setHead({ ...good, paths: { ...good.paths, [field]: "/elsewhere" } }),
+          downloads: 0,
+        })),
+        {
+          error: "CentralStateUnsupportedManifestError",
+          prepare: setHead({ ...good, minReaderVersion: 2 }),
+          downloads: 0,
+        },
+        {
+          error: "CentralBlobMissingError",
+          prepare: Effect.andThen(setHead(good), fixture.run(fixture.store.remove(dbBlobKey))),
+          downloads: null,
+        },
+        {
+          error: "CentralBlobIntegrityError",
+          prepare: fixture.run(
+            fixture.store.write(
+              dbBlobKey,
+              { _tag: "Bytes", bytes: new TextEncoder().encode("not zstd") },
+              { _tag: "None" },
+            ),
+          ),
+          downloads: null,
+        },
+      ];
+      for (const row of rows) {
+        yield* row.prepare;
+        fixture.counts.downloads = 0;
+        const error = yield* Effect.flip(prepare(fixture, "holder-b"));
+        assert.strictEqual(error._tag, row.error);
+        if (row.downloads !== null) assert.strictEqual(fixture.counts.downloads, row.downloads);
+        assert.strictEqual(fixture.read("settings.json"), "local");
+        assert.isFalse(NodeFS.existsSync(`${workDir}/aside`));
+        assert.deepStrictEqual(
+          Option.getOrThrow(yield* Manifest.readMarker(stateDir)),
+          markerBefore,
+        );
+        assert.deepStrictEqual(
+          NodeFS.readdirSync(`${workDir}/tmp`).filter((name) => name.startsWith("restore-")),
+          [],
+        );
+      }
+    }),
+  );
+
+  it.effect("restores again after a crash between placing files and publishing the database", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      yield* prepare(fixture, "holder-a");
+      const expected = Object.fromEntries(SYNCED.map((file) => [file, fixture.read(file)]));
+      const { dbPath, stateDir } = fixture.context("b").paths;
+
+      fixture.wipe();
+      const crashing: StateBundle.ClaudeHooks = {
+        ...noClaude,
+        stage: () =>
+          Effect.succeed({
+            place: Effect.fail(
+              PlatformError.systemError({ _tag: "Unknown", module: "test", method: "place" }),
+            ),
+          }),
+      };
+      const crashed = yield* Effect.flip(prepare(fixture, "holder-b", crashing));
+      assert.strictEqual(crashed._tag, "PlatformError");
+      assert.strictEqual(fixture.read("settings.json"), expected["settings.json"]);
+      assert.isFalse(NodeFS.existsSync(dbPath));
+      assert.isTrue(Option.isNone(yield* Manifest.readMarker(stateDir)));
+      const fencedEpoch = (yield* fixture.head()).manifest.epoch;
+
+      const rerun = yield* prepare(fixture, "holder-c");
+      assert.strictEqual(rerun.mode, "restore");
+      assert.notStrictEqual(rerun.committed.manifest.epoch, fencedEpoch);
+      for (const file of SYNCED) assert.strictEqual(fixture.read(file), expected[file], file);
+      const db = openDatabase(fixture);
+      try {
+        assert.strictEqual(db.prepare("PRAGMA quick_check").get()?.quick_check, "ok");
+      } finally {
+        db.close();
+      }
+      assert.strictEqual(
+        Option.getOrThrow(yield* Manifest.readMarker(stateDir)).epoch,
+        rerun.committed.manifest.epoch,
+      );
+    }),
+  );
+
+  it.effect("fences a superseded holder before it can commit or collect garbage", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      const adopted = yield* prepare(fixture, "holder-a");
+      let committed = adopted.committed;
+      for (let generation = 2; generation <= Manifest.RETAIN_GENERATIONS; generation += 1) {
+        fixture.write("settings.json", `{"generation":${generation}}`);
+        committed = committedOf(yield* pushClosed(fixture, "holder-a", committed, adopted.cache));
+      }
+      const firstCopy = Manifest.keys.history(homeKey, committed.manifest.epoch, 1);
+
+      fixture.wipe();
+      const restored = yield* prepare(fixture, "holder-b");
+      assert.strictEqual(restored.mode, "restore");
+
+      fixture.write("settings.json", '{"from":"a"}');
+      fixture.counts.removes.length = 0;
+      const lost = yield* Effect.flip(pushClosed(fixture, "holder-a", committed, adopted.cache));
+      assert.strictEqual(lost._tag, "CentralCasLostError");
+      assert.deepStrictEqual(fixture.counts.removes, []);
+      const head = yield* fixture.head();
+      assert.strictEqual(head.version, restored.committed.version);
+      yield* assertRefsPresent(fixture, head.manifest);
+      assert.isTrue(yield* fixture.objectExists(firstCopy));
+    }),
+  );
+
+  it.effect("reserves a new floor above every earlier restore", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      yield* prepare(fixture, "holder-a");
+
+      fixture.wipe();
+      const restoredB = yield* prepare(fixture, "holder-b", noClaude, 7);
+      const floorB = restoredB.committed.manifest.sequenceFloor;
+      assert.strictEqual(floorB, 7 + RESTORE_SEQUENCE_JUMP);
+      const sequence = yield* withDatabase(
+        fixture,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* insertEvent(100);
+          const rows = yield* sql<{ readonly sequence: number }>`
+            SELECT MAX(sequence) AS sequence FROM orchestration_events
+          `;
+          return rows[0]?.sequence;
+        }),
+      );
+      assert.strictEqual(sequence, floorB);
+
+      fixture.wipe();
+      const restoredC = yield* prepare(fixture, "holder-c");
+      assert.strictEqual(
+        restoredC.committed.manifest.sequenceFloor,
+        floorB + RESTORE_SEQUENCE_JUMP,
+      );
+    }),
+  );
+
+  it.effect("keeps a home that crashed between its head commit and its marker", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      const adopted = yield* prepare(fixture, "holder-a");
+      const { stateDir } = fixture.context("a").paths;
+      const staleMarker = Option.getOrThrow(yield* Manifest.readMarker(stateDir));
+      fixture.write("settings.json", '{"theme":"light"}');
+      const second = committedOf(
+        yield* pushClosed(fixture, "holder-a", adopted.committed, adopted.cache),
+      );
+      yield* Manifest.writeMarker(stateDir, staleMarker);
+
+      fixture.counts.downloads = 0;
+      const kept = yield* prepare(fixture, "holder-a2");
+      assert.strictEqual(kept.mode, "keep");
+      assert.strictEqual(fixture.counts.downloads, 0);
+      assert.strictEqual(kept.committed.manifest.epoch, second.manifest.epoch);
+      assert.strictEqual(kept.committed.manifest.generation, second.manifest.generation);
+      assert.deepStrictEqual(Option.getOrThrow(yield* Manifest.readMarker(stateDir)), {
+        ...staleMarker,
+        generation: second.manifest.generation,
+        holderId: "holder-a2",
+      });
+    }),
+  );
+
+  it.effect("collects only blobs no retained generation references", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      fixture.write("settings.json", "content A");
+      const adopted = yield* prepare(fixture, "holder-a");
+      const settingsBlob = (manifest: Manifest.Manifest) =>
+        manifest.files["settings.json"]!.blob.sha256;
+      const blobA = settingsBlob(adopted.committed.manifest);
+      let committed = adopted.committed;
+      const commit = Effect.gen(function* () {
+        committed = committedOf(yield* pushClosed(fixture, "holder-a", committed, adopted.cache));
+        yield* assertRefsPresent(fixture, committed.manifest);
+        return committed;
+      });
+      const copy = (generation: number) =>
+        fixture.objectExists(Manifest.keys.history(homeKey, committed.manifest.epoch, generation));
+
+      fixture.write("settings.json", "content B");
+      const blobB = settingsBlob((yield* commit).manifest);
+      fixture.write("settings.json", "content A");
+      assert.strictEqual(settingsBlob((yield* commit).manifest), blobA);
+      for (let generation = 4; generation <= Manifest.RETAIN_GENERATIONS + 1; generation += 1) {
+        fixture.write("keybindings.json", `[${generation}]`);
+        yield* commit;
+      }
+      // Generation 1 left the window, but generation 3 still holds content A.
+      assert.isFalse(yield* copy(1));
+      assert.isTrue(yield* copy(2));
+      assert.isTrue(yield* fixture.blobExists(blobA));
+      assert.isTrue(yield* fixture.blobExists(blobB));
+
+      fixture.write("keybindings.json", "[12]");
+      yield* commit;
+      assert.isFalse(yield* copy(2));
+      assert.isFalse(yield* fixture.blobExists(blobB));
+
+      // Content that returns after its blob was collected is uploaded again.
+      fixture.write("settings.json", "content B");
+      assert.strictEqual(settingsBlob((yield* commit).manifest), blobB);
+      assert.isTrue(yield* fixture.blobExists(blobB));
+    }),
+  );
+
+  it.effect("pins the generation before a migration past the history window", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const { dbPath, stateDir } = fixture.context("a").paths;
+      NodeFS.mkdirSync(stateDir, { recursive: true });
+      yield* runMigrations({ toMigrationInclusive: BUILD_MIGRATION_HEAD - 1 }).pipe(
+        Effect.provide(NodeSqliteClient.layer({ filename: dbPath })),
+      );
+      const adopted = yield* prepare(fixture, "holder-a");
+      const oldDatabase = adopted.committed.manifest.database!;
+      assert.strictEqual(oldDatabase.migrations.at(-1)?.id, BUILD_MIGRATION_HEAD - 1);
+
+      yield* runMigrations().pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath })));
+      let committed = committedOf(
+        yield* pushClosed(fixture, "holder-a", adopted.committed, adopted.cache),
+      );
+      const epoch = committed.manifest.epoch;
+      assert.deepStrictEqual(committed.manifest.pinned, [
+        { epoch, generation: 1, migrationHead: BUILD_MIGRATION_HEAD - 1 },
+      ]);
+      for (let generation = 3; generation <= Manifest.RETAIN_GENERATIONS + 2; generation += 1) {
+        fixture.write("settings.json", `{"generation":${generation}}`);
+        committed = committedOf(yield* pushClosed(fixture, "holder-a", committed, adopted.cache));
+      }
+      assert.isFalse(committed.manifest.history.some((ref) => ref.generation === 1));
+      assert.strictEqual(committed.manifest.pinned[0]?.generation, 1);
+      assert.isTrue(yield* fixture.objectExists(Manifest.keys.history(homeKey, epoch, 1)));
+      assert.isTrue(yield* fixture.blobExists(oldDatabase.blob.sha256));
+      assert.isFalse(yield* fixture.objectExists(Manifest.keys.history(homeKey, epoch, 2)));
+    }),
+  );
+});

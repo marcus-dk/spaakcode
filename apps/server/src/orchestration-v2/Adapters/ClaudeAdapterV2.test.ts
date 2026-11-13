@@ -1717,6 +1717,28 @@ describe("ClaudeAdapterV2 resumeThread", () => {
           },
         });
         assert.equal(missing.nativeThreadRef?.nativeId, "native-thread-missing");
+
+        // A thread T3 has run needs its transcript; only an unreadable one is left to the CLI.
+        const resumeRan = (nativeId: string) =>
+          runtime.resumeThread({
+            providerThread: {
+              ...providerThread,
+              lastRunOrdinal: 1,
+              nativeThreadRef: {
+                driver: ClaudeAdapterV2.CLAUDE_PROVIDER,
+                nativeId,
+                strength: "strong",
+              },
+            },
+          });
+        const ranMissing = yield* Effect.flip(resumeRan("native-thread-missing"));
+        assert.equal(ranMissing._tag, "ProviderAdapterResumeThreadError");
+        yield* fileSystem.makeDirectory(path.join(projectDir, "native-thread-unreadable.jsonl"));
+        const unreadable = yield* resumeRan("native-thread-unreadable");
+        assert.equal(unreadable.nativeThreadRef?.nativeId, "native-thread-unreadable");
+        yield* fileSystem.remove(path.join(configDir, "projects"), { recursive: true });
+        const noProjects = yield* Effect.flip(resumeRan("native-thread-missing"));
+        assert.equal(noProjects._tag, "ProviderAdapterResumeThreadError");
       }),
     ).pipe(
       Effect.provide(
