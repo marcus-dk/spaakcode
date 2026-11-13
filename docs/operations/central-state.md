@@ -309,7 +309,9 @@ Re-check these on every upstream merge. Central state relies on them without cha
 - `claudeTranscriptState` and `resumeThread` in
   [`ClaudeAdapterV2.ts`](../../apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts). The
   fork changes them so a transcript missing from every project directory fails the resume for a
-  thread with T3 run history, which takes the fresh-session handoff.
+  thread with T3 run history, which takes the fresh-session handoff. For the same reason the Claude
+  replay testkit (`ClaudeAdapterV2.testkit.ts`) writes a transcript for every session a recording
+  resumes.
 - `CLAUDE_CONFIG_DIR` resolution and the host session variables in
   [`ClaudeHome.ts`](../../apps/server/src/provider/Drivers/ClaudeHome.ts), and the claude-runner
   variable names stripped in `ClaudeProcessEnvironment.ts`. New runner variables need adding there.

@@ -3665,6 +3665,20 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       };
     });
   const makeWakeHarness = makeWakeHarnessWithOptions();
+  // Resuming a thread T3 has already run requires its transcript on disk.
+  const makeResumingWakeHarness = Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const configDir = yield* fileSystem.makeTempDirectoryScoped({
+      prefix: "t3-claude-v2-wake-config-",
+    });
+    const projectDir = NodePath.join(configDir, "projects", "-workspace");
+    yield* fileSystem.makeDirectory(projectDir, { recursive: true });
+    yield* fileSystem.writeFileString(
+      NodePath.join(projectDir, `${WAKE_NATIVE_SESSION}.jsonl`),
+      `{"type":"user","message":{"role":"user","content":"hello"},"sessionId":"${WAKE_NATIVE_SESSION}"}\n`,
+    );
+    return yield* makeWakeHarnessWithOptions({ environment: { CLAUDE_CONFIG_DIR: configDir } });
+  });
 
   it.effect("resumes the session a /clear selected after the Claude process is replaced", () =>
     Effect.gen(function* () {
@@ -3849,7 +3863,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         assert.equal(usage?.pagesUsed, undelivered ? 0 : 60);
         if (undelivered) assert.equal(usage?.bytesUsed, 0);
         else assert.isAbove(usage?.bytesUsed ?? 0, 25 * 1024 * 1024);
-        const next = outcome === "resume-pending" ? yield* makeWakeHarness : harness;
+        const next = outcome === "resume-pending" ? yield* makeResumingWakeHarness : harness;
         const providerThread =
           outcome === "resume-pending"
             ? yield* next.runtime.resumeThread({ providerThread: persisted })
@@ -4070,7 +4084,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               }),
             )
           : persisted;
-        const resumed = yield* makeWakeHarness;
+        const resumed = yield* makeResumingWakeHarness;
         const providerThread = yield* resumed.runtime.resumeThread({ providerThread: inherited });
         yield* fileSystem.writeFileString(
           path.join(resumed.attachmentsDir, attachmentRelativePath(document)!),

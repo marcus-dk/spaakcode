@@ -205,7 +205,8 @@ export const applySequenceFloor = Effect.fn("DatabaseSnapshot.applySequenceFloor
   function* (input: { readonly path: string; readonly floor: number; readonly now: string }) {
     yield* Effect.try({
       try: () => {
-        const f1 = input.floor - 1;
+        // A JS number binds as REAL; sqlite_sequence has no column affinity to convert it back.
+        const f1 = BigInt(input.floor - 1);
         const db = new NodeSqlite.DatabaseSync(input.path);
         try {
           db.exec("BEGIN IMMEDIATE");

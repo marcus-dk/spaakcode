@@ -228,8 +228,8 @@ it.layer(NodeServices.layer)("DatabaseSnapshot", (it) => {
         const db = new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
         try {
           assert.deepEqual(
-            { ...db.prepare("SELECT name, seq FROM sqlite_sequence").get() },
-            { name: "orchestration_events", seq: 41 },
+            { ...db.prepare("SELECT name, seq, typeof(seq) AS type FROM sqlite_sequence").get() },
+            { name: "orchestration_events", seq: 41, type: "integer" },
           );
           assert.isUndefined(
             db

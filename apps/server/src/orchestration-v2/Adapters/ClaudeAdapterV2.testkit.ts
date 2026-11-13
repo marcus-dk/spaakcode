@@ -1021,6 +1021,35 @@ const writeReplayTaskOutputFiles = Effect.fn("ClaudeReplay.writeTaskOutputFiles"
   return tmpRoot;
 });
 
+/** The recorded CLI resumed these sessions from transcripts; write one per session so resumes find it. */
+const writeReplayResumedTranscripts = Effect.fn("ClaudeReplay.writeResumedTranscripts")(function* (
+  transcript: ClaudeAgentSdkReplayTranscript,
+  tmpRoot: string,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const resumed = new Set(
+    transcript.entries.flatMap((entry) => {
+      if (entry.type !== "expect_outbound") return [];
+      const frame = entry.frame as Partial<ClaudeQueryOpenFrame> | null;
+      return frame?.type === "query.open" && typeof frame.options?.resume === "string"
+        ? [frame.options.resume]
+        : [];
+    }),
+  );
+  if (resumed.size === 0) return [];
+  const configDir = path.join(tmpRoot, "claude-config");
+  const projectDir = path.join(configDir, "projects", "replay-project");
+  yield* fileSystem.makeDirectory(projectDir, { recursive: true });
+  for (const sessionId of resumed) {
+    yield* fileSystem.writeFileString(
+      path.join(projectDir, `${sessionId}.jsonl`),
+      `{"type":"user","message":{"role":"user","content":"replay"},"sessionId":"${sessionId}"}\n`,
+    );
+  }
+  return [{ name: "CLAUDE_CONFIG_DIR", value: configDir, sensitive: false }];
+});
+
 function layerClaudeProviderAdapterRegistryReplay(
   transcript: ClaudeAgentSdkReplayTranscript,
   options: {
@@ -1034,14 +1063,22 @@ function layerClaudeProviderAdapterRegistryReplay(
   ).pipe(Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)));
   return Layer.unwrap(
     writeReplayTaskOutputFiles(transcript).pipe(
+      Effect.flatMap((tmpRoot) =>
+        writeReplayResumedTranscripts(transcript, tmpRoot).pipe(
+          Effect.map((configEnvironment) => ({ tmpRoot, configEnvironment })),
+        ),
+      ),
       Effect.orDie,
-      Effect.map((tmpRoot) =>
+      Effect.map(({ tmpRoot, configEnvironment }) =>
         ProviderAdapterRegistry.layerFromAdaptersEffect(
           ClaudeAdapterV2.createClaudeAdapterV2(
             {
               instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
               displayName: undefined,
-              environment: [{ name: "CLAUDE_CODE_TMPDIR", value: tmpRoot, sensitive: false }],
+              environment: [
+                { name: "CLAUDE_CODE_TMPDIR", value: tmpRoot, sensitive: false },
+                ...configEnvironment,
+              ],
               enabled: true,
               config: DEFAULT_CLAUDE_SETTINGS,
             },
