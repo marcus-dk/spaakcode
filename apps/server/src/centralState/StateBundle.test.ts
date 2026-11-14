@@ -6,7 +6,9 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -14,13 +16,15 @@ import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as TestClock from "effect/testing/TestClock";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { BUILD_MIGRATION_HEAD } from "../persistence/databaseMigrationHead.ts";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
-import type { HeldLease, LeaseLoss } from "./CentralLease.ts";
+import { CentralStateFencedError, type HeldLease, type LeaseLoss } from "./CentralLease.ts";
 import * as CentralObjectStore from "./CentralObjectStore.ts";
+import * as ClaudeTranscripts from "./ClaudeTranscripts.ts";
 import { RESTORE_SEQUENCE_JUMP } from "./DatabaseSnapshot.ts";
 import * as Manifest from "./Manifest.ts";
 import * as StateBundle from "./StateBundle.ts";
@@ -48,10 +52,13 @@ const EXCLUDED = [
   "secrets/z.bin.0a0a0a0a-0000-4000-8000-000000000003.tmp",
   `attachments/${pendingId}.png`,
   "attachments/upload.part",
+  // A key Windows would read as a path out of the home.
+  "themes/..\\escape.json",
 ];
 
-const makeLease = (headSequence: number | null = null) =>
+const makeLease = (headSequence: number | null = null, remainingMs = 60_000) =>
   Effect.gen(function* () {
+    const lost = yield* Deferred.make<LeaseLoss>();
     const lease: HeldLease = {
       holderId: "lease",
       previous:
@@ -66,8 +73,13 @@ const makeLease = (headSequence: number | null = null) =>
               takeoverRequest: null,
               writeNonce: "previous",
             }),
-      lost: yield* Deferred.make<LeaseLoss>(),
-      handoffRequested: yield* Deferred.make<{ readonly host: string; readonly pid: number }>(),
+      lost,
+      ensureHeld: Effect.gen(function* () {
+        if (!(yield* Deferred.isDone(lost))) return;
+        return yield* new CentralStateFencedError({ homeKey, reason: yield* Deferred.await(lost) });
+      }),
+      remainingMs: Effect.succeed(remainingMs),
+      awaitHandoff: Effect.never,
       release: Effect.void,
     };
     return lease;
@@ -98,6 +110,7 @@ const setup = Effect.gen(function* () {
       }),
   });
   const root = path.join(directory, "home");
+  const outside = path.join(directory, "outside");
   const stateDir = path.join(root, "userdata");
   const context = (holderId: string): StateBundle.BundleContext => ({
     homeKey,
@@ -135,7 +148,20 @@ const setup = Effect.gen(function* () {
     run(store.read(Manifest.keys.blob(homeKey, sha256))).pipe(Effect.map(Option.isSome));
   const objectExists = (key: string) => run(store.read(key)).pipe(Effect.map(Option.isSome));
   const head = () => run(Manifest.readHead(homeKey)).pipe(Effect.map(Option.getOrThrow));
-  return { store, counts, context, file, write, read, run, wipe, blobExists, objectExists, head };
+  return {
+    store,
+    counts,
+    context,
+    file,
+    outside,
+    write,
+    read,
+    run,
+    wipe,
+    blobExists,
+    objectExists,
+    head,
+  };
 });
 type Fixture = Effect.Success<typeof setup>;
 
@@ -193,13 +219,27 @@ const seedHome = (fixture: Fixture) =>
     fixture.write("secrets/files/x", "nested secret");
     fixture.write(`attachments/${attachmentId}.png`, "png bytes");
     for (const relativePath of EXCLUDED) fixture.write(relativePath, "excluded");
+    // Links out of the home are never followed.
+    NodeFS.mkdirSync(fixture.outside, { recursive: true });
+    NodeFS.writeFileSync(`${fixture.outside}/key`, "outside the home");
+    NodeFS.symlinkSync(fixture.outside, fixture.file("secrets/linked"));
+    NodeFS.symlinkSync(`${fixture.outside}/key`, fixture.file("themes/linked.json"));
   });
 
-const prepare = (fixture: Fixture, holderId: string, claude = noClaude, headSequence?: number) =>
+const prepare = (
+  fixture: Fixture,
+  holderId: string,
+  claude = noClaude,
+  headSequence?: number,
+  lease?: HeldLease,
+) =>
   Effect.gen(function* () {
-    const lease = yield* makeLease(headSequence ?? null);
     return yield* fixture.run(
-      StateBundle.prepareHome({ ctx: fixture.context(holderId), lease, claude }),
+      StateBundle.prepareHome({
+        ctx: fixture.context(holderId),
+        lease: lease ?? (yield* makeLease(headSequence ?? null)),
+        claude,
+      }),
     );
   });
 
@@ -208,14 +248,16 @@ const pushClosed = (
   holderId: string,
   committed: StateBundle.Committed,
   cache: StateBundle.PushCache,
+  options: { readonly dataVersion?: number; readonly remainingMs?: number } = {},
 ) =>
   fixture.run(
     StateBundle.push({
       ctx: fixture.context(holderId),
       committed,
       cache,
-      source: { _tag: "Closed" },
+      source: { _tag: "Closed", dataVersion: options.dataVersion ?? null },
       claude: noClaude,
+      lease: { remainingMs: Effect.succeed(options.remainingMs ?? 60_000) },
     }),
   );
 
@@ -456,6 +498,102 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
     }),
   );
 
+  it.effect("restores Claude transcripts and task lists, and sets aside a lost lineage's", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const claude = yield* ClaudeTranscripts.hooks;
+      const { claudeHome } = fixture.context("a").paths;
+      const claudeFile = (relativePath: string) => `${claudeHome}/${relativePath}`;
+      const writeClaude = (relativePath: string, contents: string) => {
+        const file = claudeFile(relativePath);
+        NodeFS.mkdirSync(file.slice(0, file.lastIndexOf("/")), { recursive: true });
+        NodeFS.writeFileSync(file, contents);
+      };
+      yield* seedHome(fixture);
+      writeClaude("projects/-work/session-a.jsonl", '{"type":"user"}\n');
+      writeClaude("tasks/session-a/1.json", '{"id":"1","subject":"Ship it"}');
+      yield* prepare(fixture, "holder-a", claude);
+
+      fixture.wipe();
+      writeClaude("projects/-work/stale.jsonl", '{"type":"lost"}\n');
+      writeClaude("tasks/stale/1.json", "{}");
+      const restored = yield* prepare(fixture, "holder-b", claude);
+      assert.strictEqual(restored.mode, "restore");
+      assert.strictEqual(
+        NodeFS.readFileSync(claudeFile("projects/-work/session-a.jsonl"), "utf8"),
+        '{"type":"user"}\n',
+      );
+      assert.strictEqual(
+        NodeFS.readFileSync(claudeFile("tasks/session-a/1.json"), "utf8"),
+        '{"id":"1","subject":"Ship it"}',
+      );
+      assert.isFalse(NodeFS.existsSync(claudeFile("projects/-work/stale.jsonl")));
+      assert.isFalse(NodeFS.existsSync(claudeFile("tasks/stale")));
+      const [aside] = NodeFS.readdirSync(claudeFile(".central-aside"));
+      assert.isTrue(
+        NodeFS.existsSync(claudeFile(`.central-aside/${aside}/projects/-work/stale.jsonl`)),
+      );
+      assert.isTrue(NodeFS.existsSync(claudeFile(`.central-aside/${aside}/tasks/stale/1.json`)));
+    }),
+  );
+
+  it.effect("never fences the head once its lease lapsed during boot", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      yield* prepare(fixture, "holder-a");
+      const before = yield* fixture.head();
+
+      fixture.wipe();
+      const lease = yield* makeLease();
+      yield* Deferred.succeed(lease.lost, "expired");
+      const error = yield* Effect.flip(prepare(fixture, "holder-b", noClaude, undefined, lease));
+      assert.strictEqual(error._tag, "CentralStateFencedError");
+      assert.strictEqual((yield* fixture.head()).version, before.version);
+    }),
+  );
+
+  it.effect("retries a store that fails during boot", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      yield* prepare(fixture, "holder-a");
+      fixture.wipe();
+
+      const failed = yield* Deferred.make<void>();
+      let failures = 1;
+      const flaky = CentralObjectStore.CentralObjectStore.of({
+        ...fixture.store,
+        read: (key) =>
+          failures > 0
+            ? Effect.suspend(() => {
+                failures -= 1;
+                return Effect.andThen(
+                  Deferred.succeed(failed, undefined),
+                  Effect.fail(
+                    new CentralObjectStore.CentralObjectStoreError({
+                      operation: "read",
+                      key,
+                      status: 503,
+                      cause: new Error("unavailable"),
+                    }),
+                  ),
+                );
+              })
+            : fixture.store.read(key),
+      });
+      const lease = yield* makeLease();
+      const restoring = yield* Effect.forkChild(
+        StateBundle.prepareHome({ ctx: fixture.context("holder-b"), lease, claude: noClaude }).pipe(
+          Effect.provideService(CentralObjectStore.CentralObjectStore, flaky),
+        ),
+      );
+      yield* Deferred.await(failed);
+      yield* TestClock.adjust(Duration.seconds(1));
+      assert.strictEqual((yield* Fiber.join(restoring)).mode, "restore");
+    }),
+  );
+
   it.effect("refuses a head it cannot restore before moving anything aside", () =>
     Effect.gen(function* () {
       const fixture = yield* setup;
@@ -677,6 +815,61 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
     }),
   );
 
+  it.effect("adopts its own commit that landed after the push looked failed", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      const adopted = yield* prepare(fixture, "holder-a");
+      fixture.write("settings.json", '{"theme":"light"}');
+      // The loop never saw this commit, so it still pushes from the generation before it.
+      const landed = committedOf(
+        yield* pushClosed(fixture, "holder-a", adopted.committed, adopted.cache),
+      );
+
+      fixture.write("settings.json", '{"theme":"blue"}');
+      const outcome = yield* pushClosed(fixture, "holder-a", adopted.committed, adopted.cache);
+      assert.strictEqual(outcome._tag, "Adopted");
+      if (outcome._tag !== "Adopted") return;
+      assert.strictEqual(outcome.committed.version, landed.version);
+      // The retried push wrote its own manifest to the landed generation's history copy.
+      const copy = yield* fixture.run(
+        Manifest.readJson(
+          Manifest.keys.history(homeKey, landed.manifest.epoch, landed.manifest.generation),
+          Manifest.Manifest,
+        ),
+      );
+      assert.strictEqual(Option.getOrThrow(copy).value.writeNonce, landed.manifest.writeNonce);
+
+      const next = committedOf(
+        yield* pushClosed(fixture, "holder-a", outcome.committed, adopted.cache),
+      );
+      assert.strictEqual(next.manifest.generation, landed.manifest.generation + 1);
+    }),
+  );
+
+  it.effect("reuses the database in the final push when the reader saw no write since", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      const adopted = yield* prepare(fixture, "holder-a");
+      const database = adopted.committed.manifest.database!;
+      adopted.cache.lastPushedDataVersion = 5;
+      yield* withDatabase(fixture, insertEvent(4));
+      fixture.write("settings.json", '{"theme":"light"}');
+
+      const reused = committedOf(
+        yield* pushClosed(fixture, "holder-a", adopted.committed, adopted.cache, {
+          dataVersion: 5,
+        }),
+      );
+      assert.deepStrictEqual(reused.manifest.database, database);
+      const copied = committedOf(
+        yield* pushClosed(fixture, "holder-a", reused, adopted.cache, { dataVersion: 6 }),
+      );
+      assert.strictEqual(copied.manifest.database?.maxSequence, database.maxSequence + 1);
+    }),
+  );
+
   it.effect("collects only blobs no retained generation references", () =>
     Effect.gen(function* () {
       const fixture = yield* setup;
@@ -718,6 +911,14 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
       fixture.write("settings.json", "content B");
       assert.strictEqual(settingsBlob((yield* commit).manifest), blobB);
       assert.isTrue(yield* fixture.blobExists(blobB));
+
+      // A holder whose lease may have passed to a taker deletes nothing; what it skips stays.
+      const oldest = committed.manifest.history.at(-1)!;
+      fixture.write("keybindings.json", "[14]");
+      fixture.counts.removes.length = 0;
+      yield* pushClosed(fixture, "holder-a", committed, adopted.cache, { remainingMs: 0 });
+      assert.deepStrictEqual(fixture.counts.removes, []);
+      assert.isTrue(yield* copy(oldest.generation));
     }),
   );
 

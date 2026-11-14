@@ -124,6 +124,9 @@ it("decide", () => {
   assert.strictEqual(failed.historyDirtySince, T0 + 40_000);
   assert.strictEqual(failed.otherDirtySince, T0 + 40_000);
   assert.strictEqual(SnapshotPolicy.decide(failed, T0 + 90_000, cfg), "push");
+  // A push that hung until its transport gave up says nothing about how long a push takes.
+  const stalled = SnapshotPolicy.pushed(dirty, T0 + 60_000, T0 + 360_000, "failed");
+  assert.strictEqual(SnapshotPolicy.decide(stalled, T0 + 390_000, cfg), "push");
   const saved = SnapshotPolicy.pushed(dirty, T0 + 60_000, T0 + 60_100, "unchanged");
   assert.strictEqual(saved.historyDirtySince, null);
   assert.strictEqual(saved.otherDirtySince, null);

@@ -45,6 +45,8 @@ export const TranscriptEntry = Schema.Struct({
 export const ClaudeSection = Schema.Struct({
   /** Keyed by the "/"-separated path under <claudeHome>/projects. */
   files: Schema.Record(Schema.String, TranscriptEntry),
+  /** Claude's per-session task lists, keyed by the "/"-separated path under <claudeHome>/tasks. */
+  tasks: Schema.optionalKey(Schema.Record(Schema.String, TranscriptEntry)),
 });
 export const MigrationRow = Schema.Struct({ id: Schema.Number, name: Schema.String });
 export const DatabaseRef = Schema.Struct({
@@ -202,6 +204,9 @@ export const readHead = Effect.fn("Manifest.readHead")(function* (homeKey: strin
 const RETRY_BASE_MS = 200;
 const RETRY_MAX_MS = 5_000;
 
+// A wall-clock step must not stretch or cut the retry budget.
+const monotonicMillis = Effect.map(Clock.monotonicTimeNanos, (nanos) => Number(nanos) / 1e6);
+
 /**
  * The only way CAS keys are written. An ambiguous PUT is resolved by reading the key back: our
  * `writeNonce` there means the write landed. Transport failures retry while the key is unchanged.
@@ -221,7 +226,7 @@ export const casWrite = Effect.fn("Manifest.casWrite")(function* <
   const store = yield* CentralObjectStore.CentralObjectStore;
   const bytes = textEncoder.encode(yield* encodeJson(input.schema, input.value));
   const budgetMs = Duration.toMillis(input.retryFor);
-  const startedAt = yield* Clock.currentTimeMillis;
+  const startedAt = yield* monotonicMillis;
   let attempt = 0;
   while (true) {
     const written = yield* Effect.result(
@@ -258,7 +263,7 @@ export const casWrite = Effect.fn("Manifest.casWrite")(function* <
     const jitter = 0.8 + 0.4 * (yield* Random.next);
     const delayMs = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** attempt) * jitter;
     attempt += 1;
-    const elapsedMs = (yield* Clock.currentTimeMillis) - startedAt;
+    const elapsedMs = (yield* monotonicMillis) - startedAt;
     if (elapsedMs + delayMs > budgetMs) return yield* lastError;
     yield* Effect.sleep(Duration.millis(delayMs));
   }

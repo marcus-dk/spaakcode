@@ -1,6 +1,8 @@
 // @effect-diagnostics nodeBuiltinImport:off - epochs, nonces and staging names need UUIDs.
 import * as NodeCrypto from "node:crypto";
 
+import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -9,11 +11,12 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 
 import { recordedMigrations } from "../persistence/databaseMigrationHead.ts";
 import * as Blobs from "./Blobs.ts";
-import type { HeldLease } from "./CentralLease.ts";
+import type { CentralStateFencedError, HeldLease } from "./CentralLease.ts";
 import * as CentralObjectStore from "./CentralObjectStore.ts";
 import * as DatabaseSnapshot from "./DatabaseSnapshot.ts";
 import {
@@ -167,9 +170,18 @@ export interface PushCache {
 }
 export type DbSource =
   | { readonly _tag: "Live"; readonly reader: DatabaseSnapshot.LiveReader }
-  | { readonly _tag: "Closed" };
+  | {
+      readonly _tag: "Closed";
+      /** The live reader's last data_version, read after the server closed its connection. */
+      readonly dataVersion?: number | null;
+    };
 export type PushOutcome =
   | { readonly _tag: "Committed"; readonly committed: Committed }
+  /**
+   * The head is a commit of this process that it never saw confirmed (a PUT that landed after it
+   * looked failed, or a push cut short). It is the base to push from; this push's state is not in it.
+   */
+  | { readonly _tag: "Adopted"; readonly committed: Committed }
   | { readonly _tag: "Unchanged" }
   | { readonly _tag: "NoDatabaseYet" };
 
@@ -184,10 +196,16 @@ export type PrepareError =
   | DatabaseSnapshot.CentralStateSnapshotError
   | CentralObjectStore.CentralObjectStoreError
   | CentralCasLostError
+  | CentralStateFencedError
   | PlatformError.PlatformError;
 
 const MAX_FENCE_ATTEMPTS = 5;
-const CAS_RETRY = Duration.seconds(30);
+// Outlasts one 30 s request timeout plus its read-back, so a slow PUT still gets a second attempt.
+const CAS_RETRY = Duration.seconds(75);
+// The store outage boot tolerates, like the lease acquire before it.
+const PREPARE_RETRY_FOR_MS = 120_000;
+const PREPARE_RETRY_MIN_MS = 1_000;
+const PREPARE_RETRY_MAX_MS = 15_000;
 const RESTORE_DOWNLOAD_CONCURRENCY = 8;
 const ASIDE_KEPT = 2;
 
@@ -197,10 +215,13 @@ const textEncoder = new TextEncoder();
 const refsOf = (manifest: Manifest): ReadonlyArray<string> => [
   ...(manifest.database === null ? [] : [manifest.database.blob.sha256]),
   ...Object.values(manifest.files).map((entry) => entry.blob.sha256),
-  ...Object.values(manifest.claude.files).flatMap((entry) =>
-    entry.chunks.map((chunk) => chunk.sha256),
-  ),
+  ...[
+    ...Object.values(manifest.claude.files),
+    ...Object.values(manifest.claude.tasks ?? {}),
+  ].flatMap((entry) => entry.chunks.map((chunk) => chunk.sha256)),
 ];
+
+const monotonicMillis = Effect.map(Clock.monotonicTimeNanos, (nanos) => Number(nanos) / 1e6);
 
 const migrationHead = (migrations: ReadonlyArray<{ readonly id: number }>) =>
   Math.max(0, ...migrations.map(({ id }) => id));
@@ -366,6 +387,7 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
     Math.max(previous.sequenceFloor, database.maxSequence, previousHead ?? 0) +
     DatabaseSnapshot.RESTORE_SEQUENCE_JUMP;
   // The fence reserves the floor before any download, so a superseded holder can no longer commit.
+  yield* input.lease.ensureHeld;
   const fenced = yield* writeHead(
     ctx,
     {
@@ -434,7 +456,8 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
         download(ref, destinationPath, append).pipe(Effect.provideContext(services)),
     });
 
-    // Nothing local moves until everything is staged and verified.
+    // Nothing local moves until everything is staged and verified, and only while the lease holds.
+    yield* input.lease.ensureHeld;
     const name = asideName(now, previous.epoch);
     const stateAside = path.join(ctx.paths.workDir, "aside");
     yield* StateFiles.moveAside({
@@ -442,14 +465,15 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
       asideDir: path.join(stateAside, name),
     });
     yield* pruneAside(stateAside);
-    // Transcripts of a lost lineage would carry turns the restored database lacks.
-    const projects = path.join(ctx.paths.claudeHome, "projects");
-    if (yield* fileSystem.exists(projects)) {
-      const claudeAside = path.join(ctx.paths.claudeHome, ".central-aside");
+    // Transcripts and task lists of a lost lineage would carry turns the restored database lacks.
+    const claudeAside = path.join(ctx.paths.claudeHome, ".central-aside");
+    for (const directory of ["projects", "tasks"]) {
+      const current = path.join(ctx.paths.claudeHome, directory);
+      if (!(yield* fileSystem.exists(current))) continue;
       yield* fileSystem.makeDirectory(path.join(claudeAside, name), { recursive: true });
-      yield* fileSystem.rename(projects, path.join(claudeAside, name, "projects"));
-      yield* pruneAside(claudeAside);
+      yield* fileSystem.rename(current, path.join(claudeAside, name, directory));
     }
+    if (yield* fileSystem.exists(claudeAside)) yield* pruneAside(claudeAside);
 
     yield* StateFiles.place({ stagingDir: stagedState, stateDir: ctx.paths.stateDir, files });
     yield* claude.place;
@@ -487,6 +511,8 @@ const prepareOnce = Effect.fn("StateBundle.prepareOnce")(function* (input: {
 }) {
   const { ctx } = input;
   const fileSystem = yield* FileSystem.FileSystem;
+  // A holder whose lease lapsed during boot must not fence over the server that took it.
+  yield* input.lease.ensureHeld;
   const head = yield* readHead(ctx.homeKey);
   const marker = yield* readMarker(ctx.paths.stateDir);
   const localDbExists = yield* fileSystem.exists(ctx.paths.dbPath);
@@ -508,6 +534,7 @@ const prepareOnce = Effect.fn("StateBundle.prepareOnce")(function* (input: {
 
   switch (mode) {
     case "fresh": {
+      yield* input.lease.ensureHeld;
       const committed = yield* writeHead(ctx, freshManifest(ctx, head), headVersion);
       yield* writeMarker(ctx.paths.stateDir, markerFor(ctx, committed.manifest));
       return { committed, mode, cache: yield* seedCache(ctx, committed.manifest) };
@@ -517,6 +544,7 @@ const prepareOnce = Effect.fn("StateBundle.prepareOnce")(function* (input: {
         ctx.homeKey,
         yield* localMigrations(ctx.paths.dbPath),
       );
+      yield* input.lease.ensureHeld;
       const fenced = yield* writeHead(ctx, freshManifest(ctx, head), headVersion);
       yield* writeMarker(ctx.paths.stateDir, markerFor(ctx, fenced.manifest));
       const cache = yield* seedCache(ctx, fenced.manifest);
@@ -527,8 +555,10 @@ const prepareOnce = Effect.fn("StateBundle.prepareOnce")(function* (input: {
         cache,
         source: { _tag: "Closed" },
         claude: input.claude,
+        lease: input.lease,
       });
-      const committed = outcome._tag === "Committed" ? outcome.committed : fenced;
+      const committed =
+        outcome._tag === "Committed" || outcome._tag === "Adopted" ? outcome.committed : fenced;
       return { committed, mode, cache };
     }
     case "keep":
@@ -543,6 +573,7 @@ const prepareOnce = Effect.fn("StateBundle.prepareOnce")(function* (input: {
           ctx.homeKey,
           yield* localMigrations(ctx.paths.dbPath),
         );
+        yield* input.lease.ensureHeld;
         const committed = yield* writeHead(
           ctx,
           { ...current.manifest, holder: ctx.holder, writeNonce: NodeCrypto.randomUUID() },
@@ -571,18 +602,33 @@ export const prepareHome = Effect.fn("StateBundle.prepareHome")(function* (input
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const tmp = path.join(input.ctx.paths.workDir, "tmp");
-  yield* fileSystem.remove(tmp, { recursive: true, force: true });
-  yield* fileSystem.makeDirectory(tmp, { recursive: true });
-  // A lost fence write means the head moved since it was read, e.g. the old holder's last commit.
-  for (let attempt = 1; ; attempt += 1) {
-    const prepared = yield* prepareOnce(input).pipe(
-      Effect.asSome,
-      Effect.catchTags({
-        CentralCasLostError: (error) =>
-          attempt < MAX_FENCE_ATTEMPTS ? Effect.succeedNone : Effect.fail(error),
-      }),
+  const startedAt = yield* monotonicMillis;
+  let fenceAttempts = 0;
+  let storeRetries = 0;
+  while (true) {
+    yield* fileSystem.remove(tmp, { recursive: true, force: true });
+    yield* fileSystem.makeDirectory(tmp, { recursive: true });
+    // prepareOnce re-reads the head and checks the lease each time, so it can always run again.
+    const outcome = yield* Effect.result(prepareOnce(input));
+    if (Result.isSuccess(outcome)) return outcome.success;
+    const error = outcome.failure;
+    // A lost fence write means the head moved since it was read, e.g. the old holder's last commit.
+    if (error._tag === "CentralCasLostError") {
+      fenceAttempts += 1;
+      if (fenceAttempts >= MAX_FENCE_ATTEMPTS) return yield* error;
+      continue;
+    }
+    // Boot outlasts the same store outage the lease acquire does.
+    if (error._tag !== "CentralObjectStoreError") return yield* error;
+    const delayMs = Math.min(PREPARE_RETRY_MAX_MS, PREPARE_RETRY_MIN_MS * 2 ** storeRetries);
+    storeRetries += 1;
+    if ((yield* monotonicMillis) - startedAt + delayMs > PREPARE_RETRY_FOR_MS) {
+      return yield* error;
+    }
+    yield* Effect.logWarning("Central state store failed during boot; retrying.").pipe(
+      Effect.annotateLogs({ homeKey: input.ctx.homeKey, status: error.status, cause: error }),
     );
-    if (Option.isSome(prepared)) return prepared.value;
+    yield* Effect.sleep(Duration.millis(delayMs));
   }
 });
 
@@ -591,9 +637,18 @@ const collectGarbage = Effect.fn("StateBundle.collectGarbage")(function* (input:
   readonly previous: Manifest;
   readonly next: Manifest;
   readonly cache: PushCache;
+  readonly lease: Pick<HeldLease, "remainingMs">;
 }) {
   const store = yield* CentralObjectStore.CentralObjectStore;
   const { cache } = input;
+  // A taker steals no sooner than this holder must stop, so a delete that ends inside the lease
+  // can never remove a blob the next holder has just uploaded.
+  const remove = (key: string) =>
+    Effect.flatMap(input.lease.remainingMs, (remainingMs) =>
+      remainingMs <= 0
+        ? Effect.fail(new Cause.TimeoutError("The lease may have passed to another server."))
+        : store.remove(key).pipe(Effect.timeout(Duration.millis(remainingMs))),
+    );
   const historyKey = (ref: { readonly epoch: string; readonly generation: number }) =>
     keys.history(input.homeKey, ref.epoch, ref.generation);
   const retained = new Set([...input.next.history, ...input.next.pinned].map(historyKey));
@@ -632,14 +687,60 @@ const collectGarbage = Effect.fn("StateBundle.collectGarbage")(function* (input:
     const manifest = yield* load(key);
     if (Option.isSome(manifest)) {
       const orphaned = new Set(refsOf(manifest.value).filter((sha256) => !keep.has(sha256)));
-      yield* Effect.forEach(orphaned, (sha256) => store.remove(keys.blob(input.homeKey, sha256)), {
+      yield* Effect.forEach(orphaned, (sha256) => remove(keys.blob(input.homeKey, sha256)), {
         concurrency: 4,
         discard: true,
       });
     }
-    yield* store.remove(key);
+    yield* remove(key);
     cache.historyManifests.delete(key);
   }
+});
+
+/** The head is the commit point; a marker it cannot write only costs a restore on a crash. */
+const writeMarkerQuietly = (ctx: BundleContext, manifest: Manifest) =>
+  writeMarker(ctx.paths.stateDir, markerFor(ctx, manifest)).pipe(
+    Effect.catch((error) =>
+      Effect.logWarning("Could not write the central state marker.").pipe(
+        Effect.annotateLogs({ homeKey: ctx.homeKey, error: error._tag }),
+      ),
+    ),
+  );
+
+/**
+ * A head that carries this process's holderId was written by this process, since no other process
+ * writes it. CAS lost to such a head means an earlier write of ours landed unconfirmed: adopt it.
+ */
+const adoptOwnHead = Effect.fn("StateBundle.adoptOwnHead")(function* (
+  ctx: BundleContext,
+  cache: PushCache,
+  lost: CentralCasLostError,
+) {
+  const head = yield* readHead(ctx.homeKey);
+  if (Option.isNone(head) || head.value.manifest.holder.holderId !== ctx.holder.holderId) {
+    return yield* lost;
+  }
+  const { manifest } = head.value;
+  const historyKey = keys.history(ctx.homeKey, manifest.epoch, manifest.generation);
+  if (manifest.committedBy === ctx.holder.holderId) {
+    // This push may have overwritten the head's history copy with its own, uncommitted manifest.
+    const store = yield* CentralObjectStore.CentralObjectStore;
+    yield* store
+      .write(
+        historyKey,
+        { _tag: "Bytes", bytes: textEncoder.encode(encodeManifestJson(manifest)) },
+        { _tag: "None" },
+      )
+      .pipe(Effect.catchTags({ CentralObjectPreconditionError: (error) => Effect.die(error) }));
+    cache.historyManifests.set(historyKey, manifest);
+  }
+  for (const sha256 of refsOf(manifest)) cache.knownBlobs.add(sha256);
+  yield* writeMarkerQuietly(ctx, manifest);
+  yield* Effect.logWarning("Adopted an unconfirmed central state commit of this server.").pipe(
+    Effect.annotateLogs({ homeKey: ctx.homeKey, generation: manifest.generation }),
+  );
+  const outcome: PushOutcome = { _tag: "Adopted", committed: head.value };
+  return outcome;
 });
 
 export const push = Effect.fn("StateBundle.push")(function* (input: {
@@ -648,6 +749,7 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
   readonly cache: PushCache;
   readonly source: DbSource;
   readonly claude: ClaudeHooks;
+  readonly lease: Pick<HeldLease, "remainingMs">;
 }) {
   const { ctx, cache } = input;
   const previous = input.committed.manifest;
@@ -670,7 +772,9 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
   return yield* Effect.gen(function* () {
     // Read before the backup, so a write that lands during it is pushed next time.
     const dataVersion =
-      input.source._tag === "Live" ? yield* input.source.reader.dataVersion : null;
+      input.source._tag === "Live"
+        ? yield* input.source.reader.dataVersion
+        : (input.source.dataVersion ?? null);
     let database: typeof DatabaseRef.Type;
     if (
       dataVersion !== null &&
@@ -690,14 +794,7 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
       } else {
         yield* DatabaseSnapshot.backupClosed(ctx.paths.dbPath, copy);
       }
-      const inspected = yield* DatabaseSnapshot.inspect(copy);
-      if (inspected.quickCheck !== "ok") {
-        return yield* new DatabaseSnapshot.CentralStateSnapshotError({
-          stage: "inspect",
-          path: copy,
-          cause: new Error(`quick_check reported: ${inspected.quickCheck.slice(0, 200)}`),
-        });
-      }
+      const inspected = yield* DatabaseSnapshot.inspect(copy, { quickCheck: false });
       database = {
         blob: yield* upload(copy),
         migrations: inspected.migrations,
@@ -771,14 +868,19 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
         },
       )
       .pipe(Effect.catchTags({ CentralObjectPreconditionError: (error) => Effect.die(error) }));
-    const committed = yield* writeHead(ctx, next, Option.some(input.committed.version));
+    const written = yield* writeHead(ctx, next, Option.some(input.committed.version)).pipe(
+      Effect.map((committed): PushOutcome => ({ _tag: "Committed", committed })),
+      Effect.catchTags({ CentralCasLostError: (lost) => adoptOwnHead(ctx, cache, lost) }),
+    );
+    if (written._tag !== "Committed") return written;
+    const committed = written.committed;
 
-    yield* writeMarker(ctx.paths.stateDir, markerFor(ctx, next));
+    yield* writeMarkerQuietly(ctx, next);
     if (dataVersion !== null) cache.lastPushedDataVersion = dataVersion;
     for (const sha256 of refsOf(next)) cache.knownBlobs.add(sha256);
     cache.historyManifests.set(historyKey, next);
 
-    yield* collectGarbage({ homeKey: ctx.homeKey, previous, next, cache }).pipe(
+    yield* collectGarbage({ homeKey: ctx.homeKey, previous, next, cache, lease: input.lease }).pipe(
       Effect.catch((error) =>
         Effect.logWarning("Central state GC failed; unreferenced blobs may remain.").pipe(
           Effect.annotateLogs({ error: error._tag }),

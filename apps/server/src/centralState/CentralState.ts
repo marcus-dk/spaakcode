@@ -7,14 +7,12 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
-import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Runtime from "effect/Runtime";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
-import { FetchHttpClient } from "effect/http";
 
 import packageJson from "../../package.json" with { type: "json" };
 import type * as ServerConfig from "../config.ts";
@@ -31,19 +29,6 @@ import * as ClaudeTranscripts from "./ClaudeTranscripts.ts";
 import * as SnapshotLoop from "./SnapshotLoop.ts";
 import * as StateBundle from "./StateBundle.ts";
 
-export class CentralStateFencedError extends Schema.TaggedError<CentralStateFencedError>()(
-  "CentralStateFencedError",
-  { homeKey: Schema.String, reason: Schema.Literals(["superseded", "expired"]) },
-) {
-  override readonly [Runtime.errorExitCode] = SERVER_EXIT_CODE_STATE_DIR_OWNED;
-
-  override get message(): string {
-    return this.reason === "superseded"
-      ? `Another server took over T3 home ${this.homeKey}, so this server stopped without saving again.`
-      : `T3 home ${this.homeKey} could not renew its lease in time, so this server stopped. Changes since the last save may be lost.`;
-  }
-}
-
 export class CentralStateHandedOffError extends Schema.TaggedError<CentralStateHandedOffError>()(
   "CentralStateHandedOffError",
   { homeKey: Schema.String, toHost: Schema.String, toPid: Schema.Number },
@@ -55,10 +40,21 @@ export class CentralStateHandedOffError extends Schema.TaggedError<CentralStateH
   }
 }
 
+/** Not the do-not-restart code: a restart in this pod reclaims the lease and keeps the local home. */
+export class CentralStateHandoffUnsavedError extends Schema.TaggedError<CentralStateHandoffUnsavedError>()(
+  "CentralStateHandoffUnsavedError",
+  { homeKey: Schema.String, toHost: Schema.String, toPid: Schema.Number },
+) {
+  override get message(): string {
+    return `T3 home ${this.homeKey} could not be saved for the handover to ${this.toHost} (pid ${this.toPid}), so this server stopped and kept the lease. Changes since the last save are only on this machine; restart T3 here to keep them.`;
+  }
+}
+
 export type CentralStateError =
   | CentralStateConfigError
-  | CentralStateFencedError
+  | CentralLease.CentralStateFencedError
   | CentralStateHandedOffError
+  | CentralStateHandoffUnsavedError
   | CentralLease.CentralStateLeaseHeldError
   | StateBundle.PrepareError
   | ServerOwnership.ServerAlreadyRunningError
@@ -67,7 +63,7 @@ export type CentralStateError =
 const storeLayer = (store: CentralStateSettings["store"]) =>
   store._tag === "Filesystem"
     ? CentralObjectStore.layerFilesystem(store.root)
-    : CentralObjectStore.layerHttp(store).pipe(Layer.provide(FetchHttpClient.layer));
+    : CentralObjectStore.layerHttpUndici(store);
 
 const readBootId = Effect.gen(function* () {
   if ((yield* HostProcess.Platform) !== "linux") return null;
@@ -78,14 +74,24 @@ const readBootId = Effect.gen(function* () {
   );
 });
 
-const run = Effect.fn("CentralState.supervise")(function* <A, E, R>(
+export interface SuperviseOptions<R> {
+  /**
+   * Runs once the server has stopped and the snapshot loop has closed its database reader, before
+   * the final push, so it may take the database exclusively and its result is what gets saved.
+   */
+  readonly afterServerStop?: Effect.Effect<void, never, R>;
+}
+
+const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
   config: ServerConfig.ServerConfig["Service"],
   server: Effect.Effect<A, E, R>,
+  options: SuperviseOptions<R2>,
 ) {
+  const afterServerStop = options.afterServerStop ?? Effect.void;
   const loaded = yield* centralStateConfig.pipe(
     Effect.mapError((cause) => new CentralStateConfigError({ cause })),
   );
-  if (Option.isNone(loaded)) return yield* server;
+  if (Option.isNone(loaded)) return yield* server.pipe(Effect.ensuring(afterServerStop));
   const settings = loaded.value;
   const path = yield* Path.Path;
 
@@ -157,6 +163,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R>(
       finalPushTimeout: settings.finalPushTimeout,
       head,
       isFenced: Deferred.isDone(lease.lost),
+      lease,
     });
 
     const isFenced = Effect.map(
@@ -164,40 +171,65 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R>(
       ([lost, fenced]) => lost || fenced,
     );
     const fencedError = (reason: CentralLease.LeaseLoss) =>
-      new CentralStateFencedError({ homeKey: settings.homeKey, reason });
+      new CentralLease.CentralStateFencedError({ homeKey: settings.homeKey, reason });
+    const handoff = yield* Ref.make<{ readonly host: string; readonly pid: number } | null>(null);
     const awaitStop = Effect.raceFirst(
       Effect.flatMap(Deferred.await(lease.lost), (reason) => Effect.fail(fencedError(reason))),
       Effect.raceFirst(
         Effect.andThen(Deferred.await(loop.fenced), Effect.fail(fencedError("superseded"))),
-        Effect.flatMap(Deferred.await(lease.handoffRequested), (to) =>
-          Effect.fail(
-            new CentralStateHandedOffError({
-              homeKey: settings.homeKey,
-              toHost: to.host,
-              toPid: to.pid,
-            }),
+        Effect.flatMap(lease.awaitHandoff, (to) =>
+          Effect.andThen(
+            Ref.set(handoff, to),
+            Effect.fail(
+              new CentralStateHandedOffError({
+                homeKey: settings.homeKey,
+                toHost: to.host,
+                toPid: to.pid,
+              }),
+            ),
           ),
         ),
       ),
     );
 
-    // Runs on every exit, SIGTERM included. The renewal stays live until the lease is released.
+    // Runs on every exit, SIGTERM included. The renewal stays live until the lease is released,
+    // and the lease is released only once the head holds this home: otherwise the next server
+    // would restore an older save, while a restart here keeps the local home.
     const finalize = Effect.gen(function* () {
       yield* loop.stop;
-      if (yield* isFenced) return;
-      yield* loop.finalPush;
-      if (yield* isFenced) return;
+      yield* afterServerStop;
+      if (yield* isFenced) return false;
+      const saved = yield* loop.finalPush;
+      if (!saved || (yield* isFenced)) return false;
       yield* lease.release;
+      return true;
     });
 
-    return yield* Effect.raceFirst(server, awaitStop).pipe(Effect.onExit(() => finalize));
+    return yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const exit = yield* Effect.exit(restore(Effect.raceFirst(server, awaitStop)));
+        const saved = yield* finalize;
+        const to = yield* Ref.get(handoff);
+        if (to !== null && !saved && !(yield* isFenced)) {
+          return yield* new CentralStateHandoffUnsavedError({
+            homeKey: settings.homeKey,
+            toHost: to.host,
+            toPid: to.pid,
+          });
+        }
+        return yield* exit;
+      }),
+    );
   }).pipe(Effect.scoped, Effect.provide(storeLayer(settings.store)));
 });
 
-/** Identity when T3CODE_CENTRAL_STATE_URL is unset. Data-last, so cli/server.ts adds one pipe line. */
+/**
+ * The server, then afterServerStop, when T3CODE_CENTRAL_STATE_URL is unset. Data-last, so
+ * cli/server.ts adds one pipe line.
+ */
 export const supervise =
-  (config: ServerConfig.ServerConfig["Service"]) =>
+  <R2 = never>(config: ServerConfig.ServerConfig["Service"], options: SuperviseOptions<R2> = {}) =>
   <A, E, R>(
     server: Effect.Effect<A, E, R>,
-  ): Effect.Effect<A, E | CentralStateError, R | FileSystem.FileSystem | Path.Path> =>
-    run(config, server);
+  ): Effect.Effect<A, E | CentralStateError, R | R2 | FileSystem.FileSystem | Path.Path> =>
+    run(config, server, options);

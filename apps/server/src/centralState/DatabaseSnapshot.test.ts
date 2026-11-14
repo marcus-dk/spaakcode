@@ -160,6 +160,31 @@ it.layer(NodeServices.layer)("DatabaseSnapshot", (it) => {
     ),
   );
 
+  it.effect("marks session and pairing-link changes that do not touch the event log", () =>
+    withTempDir((directory, path) =>
+      Effect.gen(function* () {
+        const dbPath = path.join(directory, "statev2.sqlite");
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const reader = Option.getOrThrow(yield* DatabaseSnapshot.openLiveReader(dbPath));
+          const markers = [yield* reader.authMarker];
+          yield* sql`
+            INSERT INTO auth_sessions (session_id, subject, scopes, method, client_label,
+              client_ip_address, client_user_agent, client_device_type, client_os, client_browser,
+              issued_at, expires_at, revoked_at)
+            VALUES ('session-a', 'owner', '[]', 'browser-session-cookie', NULL, NULL, NULL,
+              'desktop', NULL, NULL, ${occurredAt}, '2099-01-01T00:00:00.000Z', NULL)
+          `;
+          markers.push(yield* reader.authMarker);
+          yield* sql`UPDATE auth_sessions SET revoked_at = ${occurredAt} WHERE session_id = 'session-a'`;
+          markers.push(yield* reader.authMarker);
+          assert.equal(new Set(markers).size, 3);
+          assert.equal(yield* reader.headSequence, 0);
+        }).pipe(Effect.provide(SqlitePersistence.layerFromPath(dbPath)));
+      }),
+    ),
+  );
+
   it.effect("makes clients drop cursors from the range a restore lost", () =>
     withTempDir((directory, path) =>
       Effect.gen(function* () {

@@ -3,6 +3,7 @@ import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
 import * as NodeSqlite from "node:sqlite";
 
+import * as NodeHttpClient from "@effect/platform-node/NodeHttpClient";
 import type * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
@@ -279,11 +280,18 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
   const fileSystem = yield* FileSystem.FileSystem;
   const versionHeader = options.preconditions === "gcs" ? "x-goog-generation" : "etag";
 
-  const objectUrl = (key: string) => {
+  // URL resolution would apply "." and ".." segments before the request is sent, so a key that
+  // names one could reach outside the base path.
+  const objectUrl = (operation: Operation, key: string) => {
+    const segments = key.split("/");
+    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+      return Effect.fail(
+        storeError(operation, key, new Error("Object keys have no empty, . or .. segments.")),
+      );
+    }
     const url = new URL(options.baseUrl);
-    const segments = key.split("/").map(encodeURIComponent).join("/");
-    url.pathname = `${url.pathname.replace(/\/+$/, "")}/${segments}`;
-    return url;
+    url.pathname = `${url.pathname.replace(/\/+$/, "")}/${segments.map(encodeURIComponent).join("/")}`;
+    return Effect.succeed(url);
   };
 
   const authorization = (operation: Operation, key: string) => {
@@ -358,8 +366,9 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
   return CentralObjectStore.of({
     read: Effect.fn("CentralObjectStore.http.read")(
       function* (key) {
+        const url = yield* objectUrl("read", key);
         const headers = yield* authorization("read", key);
-        const response = yield* client.execute(HttpClientRequest.get(objectUrl(key), { headers }));
+        const response = yield* client.execute(HttpClientRequest.get(url, { headers }));
         if (response.status === 404) {
           yield* drain(response);
           return Option.none();
@@ -373,8 +382,9 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
     ),
     download: Effect.fn("CentralObjectStore.http.download")(
       function* (key, destinationPath) {
+        const url = yield* objectUrl("download", key);
         const headers = yield* authorization("download", key);
-        const response = yield* client.execute(HttpClientRequest.get(objectUrl(key), { headers }));
+        const response = yield* client.execute(HttpClientRequest.get(url, { headers }));
         if (response.status === 404) {
           yield* drain(response);
           return false;
@@ -392,11 +402,12 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
     ),
     write: Effect.fn("CentralObjectStore.http.write")(
       function* (key, body, precondition) {
+        const url = yield* objectUrl("write", key);
         const headers = {
           ...(yield* authorization("write", key)),
           ...preconditionHeaders(precondition),
         };
-        const base = HttpClientRequest.put(objectUrl(key), { headers });
+        const base = HttpClientRequest.put(url, { headers });
         const request =
           body._tag === "Bytes"
             ? HttpClientRequest.bodyUint8Array(base, body.bytes, "application/octet-stream")
@@ -420,10 +431,9 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
     ),
     remove: Effect.fn("CentralObjectStore.http.remove")(
       function* (key) {
+        const url = yield* objectUrl("remove", key);
         const headers = yield* authorization("remove", key);
-        const response = yield* client.execute(
-          HttpClientRequest.delete(objectUrl(key), { headers }),
-        );
+        const response = yield* client.execute(HttpClientRequest.delete(url, { headers }));
         if (
           response.status !== 200 &&
           response.status !== 202 &&
@@ -439,10 +449,19 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
   });
 });
 
-/** S3, R2, MinIO and the Spaak broker speak `etag`; the GCS XML API speaks `gcs`. Never retries. */
+/**
+ * Bearer-token auth only: the Spaak broker (or another Bearer-authenticated gateway with If-Match,
+ * If-None-Match and ETag) speaks `etag`; the GCS XML API speaks `gcs`. Never retries.
+ */
 export const layerHttp = (options: {
   readonly baseUrl: URL;
   readonly tokenFile: string | undefined;
   readonly preconditions: "etag" | "gcs";
 }): Layer.Layer<CentralObjectStore, never, HttpClient.HttpClient | FileSystem.FileSystem> =>
   Layer.effect(CentralObjectStore, makeHttp(options));
+
+/** layerHttp over undici, which sends a file body with its Content-Length; fetch sends it chunked. */
+export const layerHttpUndici = (
+  options: Parameters<typeof layerHttp>[0],
+): Layer.Layer<CentralObjectStore, never, FileSystem.FileSystem> =>
+  layerHttp(options).pipe(Layer.provide(NodeHttpClient.layerUndici));

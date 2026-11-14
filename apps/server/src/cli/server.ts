@@ -35,12 +35,11 @@ const runServerCommand = Effect.fn("server.runServerCommand")(function* (
     awaitServiceLauncherStop().pipe(Effect.andThen(Effect.interrupt)),
   ).pipe(
     // Settings' Reclaim stops the server; repair once the database is closed, before the restart.
-    Effect.ensuring(
-      DatabaseMaintenance.runRequestedReclaim(config.dbPath).pipe(
+    CentralState.supervise(config, {
+      afterServerStop: DatabaseMaintenance.runRequestedReclaim(config.dbPath).pipe(
         Effect.provide(DatabaseMaintenance.layer),
       ),
-    ),
-    CentralState.supervise(config),
+    }),
   );
   if (config.mode !== "desktop" || config.desktopBootstrapToken === undefined) return yield* run;
   return yield* Effect.raceFirst(

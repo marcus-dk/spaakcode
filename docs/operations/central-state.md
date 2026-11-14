@@ -15,8 +15,8 @@ A home is stored as a **state bundle** under `homes/<homeKey>/` in the store:
   files and Claude transcript chunks.
 - `manifest.json`: the head. A compare-and-swap write of this file is the only commit point, and
   it also fences out older servers.
-- `manifests/<epoch>/<generation>.json`: history copies of the last 10 generations, plus the 2
-  newest generations from before each migration.
+- `manifests/<epoch>/<generation>.json`: history copies of the last 10 generations, plus the last
+  generation from before each of the 2 most recent migrations.
 - `lease.json`: the record of which process serves the home.
 
 The bundle carries:
@@ -25,9 +25,15 @@ The bundle carries:
   sessions, pairing links and scheduled tasks;
 - `environment-id`, `anonymous-id`, `settings.json`, `keybindings.json` and `themes/`;
 - `secrets/`, without DPoP and cloud replay markers or `.tmp` files, so paired devices keep
-  working after a move;
+  working after a move. It holds every sensitive value entered in T3 settings, not only the auth
+  keys: source-control tokens (GitHub, Bitbucket) and sensitive provider-instance environment
+  variables such as provider API keys;
 - `attachments/`, without pending uploads and `.part` files;
-- the Claude transcripts under `<claudeHome>/projects/`, so Claude threads resume natively.
+- the Claude transcripts under `<claudeHome>/projects/`, so Claude threads resume natively, and
+  the task lists under `<claudeHome>/tasks/` that Claude's task tools read back on resume.
+
+Symbolic links under the T3 home are never followed or synced, so a symlinked `settings.json`,
+theme or secret stays behind.
 
 It does **not** carry:
 
@@ -39,8 +45,10 @@ It does **not** carry:
 - Codex and the other provider homes.
 - The `homePath` of a custom Claude instance. Only the default instance uses the synced Claude
   home.
-- Claude credentials. Supply them per developer with `CLAUDE_CODE_OAUTH_TOKEN`, or with an API key,
-  Bedrock or Vertex.
+- Claude's own login in the Claude home (its OAuth or credentials file). Supply it per developer
+  with `CLAUDE_CODE_OAUTH_TOKEN`, or with an API key, Bedrock or Vertex. Keys set as provider
+  environment variables in T3 settings are in `secrets/` and are synced.
+- Other Claude state, such as `plans/`. Plan-mode files mostly repeat what the transcript holds.
 
 ## Environment variables
 
@@ -51,14 +59,14 @@ Central state is configured through environment variables only. There are no CLI
 | `T3CODE_CENTRAL_STATE_URL`                | unset, meaning **disabled** | `file:///abs/dir` selects the filesystem backend. `http(s)://…` selects the HTTP backend; object keys are appended to this base URL. Any other scheme is a config error |
 | `T3CODE_CENTRAL_STATE_HOME_KEY`           | required when URL is set    | Per-developer key; one live server per key. Must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`                                                                             |
 | `T3CODE_CENTRAL_STATE_TOKEN_FILE`         | unset                       | Bearer token file, re-read on every request (HTTP only)                                                                                                                 |
-| `T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS` | `etag`                      | `etag` (S3, R2, MinIO, the Spaak broker) or `gcs` (GCS XML API, which uses `x-goog-generation`)                                                                         |
+| `T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS` | `etag`                      | `etag` (the Spaak broker, or another Bearer-token gateway) or `gcs` (GCS XML API, which uses `x-goog-generation`). S3, R2 and MinIO need SigV4 and are not supported    |
 | `T3CODE_CENTRAL_STATE_CLAUDE_HOME`        | `<baseDir>/claude`          | Absolute path. T3's Claude children use it as `CLAUDE_CONFIG_DIR`                                                                                                       |
 | `T3CODE_CENTRAL_STATE_TAKEOVER`           | `false`                     | Ask a live holder to hand off instead of failing fast                                                                                                                   |
 | `T3CODE_CENTRAL_STATE_DEBOUNCE`           | `10s`                       | Quiet time after the last history write before a push                                                                                                                   |
 | `T3CODE_CENTRAL_STATE_MAX_INTERVAL`       | `2m`                        | Longest a history-dirty home waits during continuous activity                                                                                                           |
 | `T3CODE_CENTRAL_STATE_IDLE_INTERVAL`      | `10m`                       | Cadence for non-history DB writes and the files-only sweep                                                                                                              |
 | `T3CODE_CENTRAL_STATE_LEASE_TTL`          | `60s`                       | Lease lifetime. The holder renews every quarter of it and stops itself after a full TTL without a renewal                                                               |
-| `T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT` | `20s`                       | Bound on the shutdown push                                                                                                                                              |
+| `T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT` | `20s`                       | Bound on the shutdown push, which retries within it, and on the wait for a push already running at shutdown                                                             |
 
 When central state is on, T3 sets `CLAUDE_CONFIG_DIR` to the Claude home before the server starts.
 It also removes the variables that bind a process to the runner's own Claude Code session
@@ -88,14 +96,21 @@ otherwise its threads point at a missing directory.
 | --------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Pod dies at least `debounce` (10 s) plus one push duration after activity settles                                                             | 0                                                                                                                                                                       |
 | OOM, SIGKILL or node loss during continuous activity                                                                                          | Up to `maxInterval` (2 min) plus one push duration, plus at most the adaptive spacing when pushes are slow                                                              |
-| Non-history DB writes (pairings, auth sessions, scheduled-task edits) and settings, keybindings or themes edits, then SIGKILL                 | Up to `idleInterval` (10 min) plus one push                                                                                                                             |
-| Graceful SIGTERM **delivered to the T3 process**, with a pod grace period of at least the server shutdown time plus `finalPushTimeout` (20 s) | 0                                                                                                                                                                       |
-| Takeover handoff that finishes within the takeover timeout (120 s)                                                                            | 0                                                                                                                                                                       |
+| Other non-history DB writes (scheduled-task edits) and settings, keybindings or themes edits, then SIGKILL                                    | Up to `idleInterval` (10 min) plus one push                                                                                                                             |
+| Graceful SIGTERM **delivered to the T3 process**, with a pod grace period as in [infra item 3](#infra-contract), when the final push succeeds | 0. If it fails, the lease is kept, so a restart in the same pod keeps the local home; another pod restores the last save                                                |
+| Takeover handoff whose final push succeeds within `finalPushTimeout`                                                                          | 0. If it fails, the holder keeps the lease and exits with `CentralStateHandoffUnsavedError`; a requester that then takes over restores the last save                    |
 | Store or broker outage                                                                                                                        | Pushes retry. After `leaseTtl` (60 s) with no renewal, T3 stops itself. A restart in the same pod keeps the local home, so nothing is lost once the store answers again |
 | This server is superseded (another pod took the lease)                                                                                        | Everything since this server's last commit, by design                                                                                                                   |
 
-Pushes are spaced at least `max(30 s, 20 × the last push duration)` apart, so snapshot work stays
-near 5% of one core. On a large database that spacing, not `maxInterval`, sets the loss window.
+Pushes are spaced at least `max(30 s, 20 × the last successful push's duration)` apart, so
+snapshot work stays near 5% of one core. On a large database that spacing, not `maxInterval`, sets
+the loss window. A failed push only restarts the 30 s floor, so an outage does not stretch it.
+
+Session and pairing-link changes (pairing, revoking a device, redeeming a single-use link) are
+pushed on the history cadence, not the idle one. A lossy restore can still undo one made in the
+last `debounce` plus a push, which brings a revoked session back to life or lets a redeemed link
+work again until it expires. After a move that followed a pod death, revoke again anything you
+revoked in the minutes before it.
 
 On runners, kubelet signals PID 1, which is the runner, not a `t3 serve` started from a Bash tool
 call. Graceful RPO 0 therefore needs the SIGTERM forward and grace period in the
@@ -119,7 +134,11 @@ The lease allows one live server per home key. Before it takes the lease, the se
 ownership lock, so a second server on the same machine and `T3CODE_HOME` fails at once with the
 usual "already running" error.
 
-A second server elsewhere fails fast, with exit code 78 so supervisors stop restarting it:
+A second server elsewhere fails fast, with exit code 78. A supervisor told not to restart on 78
+(for example systemd's `RestartPreventExitStatus=78`) then leaves it stopped. The `t3 service`
+launcher restarts it once the local ownership lock is free, which it always is when the holder is
+on another machine, and the desktop app stops its backend for good; central state is not supported
+under either of them.
 
 ```text
 T3 home <key> is served by <host> (pid <pid>). Stop that server, set
@@ -132,20 +151,29 @@ Your choices:
   once.
 - **`T3CODE_CENTRAL_STATE_TAKEOVER=1`.** The new server asks the holder to hand off. The holder
   stops its server, pushes and releases, then exits with `CentralStateHandedOffError` (exit code
-  78). Nothing is lost. If the holder cannot finish within 120 s, the request fails. A holder that
-  is still renewing is never robbed.
+  78). Nothing is lost. If the final push fails, the holder keeps the lease and exits with
+  `CentralStateHandoffUnsavedError` (exit code 1): its unsaved changes are only on its machine, and
+  a requester that takes over once the lease lapses restores the last save. If the holder cannot
+  finish within 120 s, the request fails and the requester takes it back, so a holder that sees it
+  late (for example during its own restore) keeps serving. A holder that is still renewing is
+  never robbed.
 - **A second home key.** It gives you a separate history. The two homes never merge.
 
 After an **unclean** stop on another machine, the new server waits until the old lease has gone
 unrenewed for 1.5 × `leaseTtl` (90 s), then takes it. A restart in the **same** pod after a crash
 skips that wait: same host, same boot id, same `stateDir` and a dead pid prove the holder is gone.
 
-A server that loses its lease stops itself with `CentralStateFencedError` (exit code 78), with no
-final push and no release:
+A server that loses its lease stops itself with `CentralStateFencedError`, with no final push and
+no release. A server whose lease lapses while it boots stops the same way, before it writes the
+head or moves local files.
 
-- `superseded`: another process took the lease or fenced the manifest.
-- `expired`: renewals failed for a full `leaseTtl`, usually because the store, broker or token was
-  unavailable.
+- `superseded` (exit code 78): another process took the lease or fenced the manifest.
+- `expired` (exit code 1, so supervisors restart it): renewals failed for a full `leaseTtl`,
+  usually because the store, broker or token was unavailable.
+
+A head write that landed after it looked failed, or a push cut short at shutdown, is not a fence:
+the next push finds this server's own commit at the head, adopts it and logs `Adopted an
+unconfirmed central state commit of this server.`
 
 ## Running on a Spaak runner
 
@@ -181,20 +209,28 @@ servers, and going over ends the pod.
 This repo cannot provide these. spaak-infra must:
 
 1. **Broker endpoint** `/v1/t3/objects/<key>`, in the `etag` dialect:
+   - authenticates `Authorization: Bearer <token file contents>`;
    - confines each creator to their own prefix;
-   - accepts the path charset `[A-Za-z0-9._/-]` and refuses `..`;
+   - accepts the path charset `[A-Za-z0-9._/-]` and refuses `..` (T3 never sends an empty, `.` or
+     `..` segment);
    - maps `If-None-Match: *` and `If-Match` to GCS `x-goog-if-generation-match` `0` or
      `<generation>`;
-   - returns `ETag` (the quoted generation) on GET and PUT, and 412 on a precondition failure;
-   - streams bodies up to 5 GiB, with request timeouts of at least 10 min;
+   - answers GET with 200 or 404, and PUT with 200, 201 or 204; both carry `ETag` (the quoted
+     generation). A precondition failure is 412;
+   - accepts unconditional `DELETE` with the same confinement, answering 204 (or 200 or 202), and
+     404 only when the object is absent. Never answer 404 for an unsupported method: T3 reads it
+     as deleted, and garbage collection would leak storage without a warning;
+   - streams PUT bodies up to 5 GiB, which arrive with `Content-Length`, with request timeouts of
+     at least 10 min;
    - runs at least 2 replicas. A broker outage longer than `leaseTtl` stops every T3 server.
 2. **Token refresher.** Keep `$SESSION_ENV_DIR/token` valid for at least `leaseTtl` + 60 s while T3
    runs, whether or not Claude is active. Today the file is refreshed only when Claude runs a Bash
    command (`/etc/claude/session-env.sh`). The alternative is a long-lived per-home credential from
    the broker. After `leaseTtl` without a valid token, T3 stops itself.
 3. **SIGTERM to T3.** A preStop hook or the post-session hook sends SIGTERM to the pid in
-   `/tmp/t3.pid` and waits for it, or T3 runs as the pod's PID 1. Set
-   `terminationGracePeriodSeconds >= 45`.
+   `/tmp/t3.pid` and waits for it, or T3 runs as the pod's PID 1. Shutdown takes the server's own
+   stop, up to `finalPushTimeout` waiting for a push already running, up to `finalPushTimeout` for
+   the final push and up to 15 s for the release. Set `terminationGracePeriodSeconds >= 75`.
 4. **Port and route.** Add a `t3` port to the per-session Service and a `t3-` host prefix to
    sessions-router. The route must pass WebSockets, keep `Host`, set `X-Forwarded-Proto=https`, and
    do no HTTP-level SSO, which breaks CORS, mobile and peer links. A stable per-developer host,
@@ -202,8 +238,14 @@ This repo cannot provide these. spaak-infra must:
    session URL as a route to the saved environment.
 5. **Activity.** Count T3 activity as runner activity. Otherwise the idle shutdowns stop T3
    mid-turn.
-6. **Bucket.** Use a per-developer, access-controlled, encrypted bucket with a retention policy and
-   a GDPR purge path. See [Data governance](#data-governance).
+6. **Bucket.** Use a per-developer, access-controlled, encrypted bucket with a documented
+   data-retention process and a GDPR purge path. See [Data governance](#data-governance).
+   - Do not enable GCS bucket retention policies, Bucket Lock or S3 Object Lock: `manifest.json`
+     and `lease.json` are overwritten in place.
+   - No age-based or prefix lifecycle rule may delete or archive anything under `homes/*/`.
+     Blobs are deduplicated forever, so a referenced blob, such as the signing key or an old
+     transcript chunk, keeps the age of its first upload, and deleting it makes the home
+     unrestorable.
 
 ## Multi-developer limitations
 
@@ -248,6 +290,15 @@ Ranked by how likely each is to bite a team, worst first.
 12. **No hosted T3 Connect.** The hosted relay can mint full-scope sessions on a linked environment
     and makes the pod reachable from the internet. Keep `"connect": false`. Peer links break when a
     peer's URL changes, so relink them after a move.
+13. **Restoring a very large home blocks the server thread.** Restore checks the downloaded
+    database with `PRAGMA quick_check` and checkpoints it synchronously, about 2 s per GB. Lease
+    renewals wait meanwhile, so a home above roughly 20 GB can let the lease lapse during boot. The
+    server then stops with `CentralStateFencedError` (`expired`) before it changes anything; pushes
+    skip the check.
+14. **Garbage collection is fenced by time, not by a lock.** A holder deletes unreferenced blobs
+    only while its lease is valid, and bounds each delete by the time left, because a taker steals
+    no sooner. A delete that the network holds back for longer than half a `leaseTtl` can still
+    reach the store after a new holder reused that blob.
 
 ## Operations
 
@@ -260,15 +311,18 @@ at least <n> committed events after it were lost.
 
 The second clause appears only when the lease's last reported event head proves a loss. A
 self-fence ends the server with `CentralStateFencedError` and its reason. Failed pushes log a
-warning with the error tag and retry on the next tick.
+warning with the error tag and retry once the push spacing (at least 30 s) has passed. A store
+error during boot is retried for up to 120 s.
 
-**Recover set-aside files.** Restore never deletes local state. It moves what it replaces to:
+**Recover set-aside files.** Restore moves what it replaces aside instead of deleting it:
 
 - `<stateDir>/central-state/aside/<time>-<old epoch>/`, for the database and state files;
-- `<claudeHome>/.central-aside/<time>/projects/`, for Claude transcripts.
+- `<claudeHome>/.central-aside/<time>-<old epoch>/`, for Claude transcripts (`projects/`) and task
+  lists (`tasks/`).
 
-The two newest directories in each location are kept. Copy from them; do not move them back while
-a server runs.
+Only the two newest directories in each location are kept. Older ones, set-aside databases
+included, are deleted by later restores, so copy what you need from them soon; do not move them
+back while a server runs.
 
 **Roll back a home.** Stop every server for the key first, and check that `lease.json` has
 `"holder": null`. Then write a history copy over `manifest.json`:
@@ -281,7 +335,8 @@ a server runs.
 4. Write it with the current head's version as the precondition (`If-Match` on the HTTP backend).
 
 **Downgrade after an upgrade.** Roll back to the newest `pinned` entry whose `migrationHead` the
-older image knows. Everything committed after it is lost.
+older image knows. Only the last generation before each of the 2 most recent migrations is pinned.
+Everything committed after it is lost.
 
 **Filesystem backend.** `file://` stores keep their CAS index in `<root>/cas.sqlite`, which needs
 reliable SQLite locking. Use it for tests and for a single-writer local disk or RWO volume, never
@@ -309,14 +364,20 @@ Re-check these on every upstream merge. Central state relies on them without cha
 - `claudeTranscriptState` and `resumeThread` in
   [`ClaudeAdapterV2.ts`](../../apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts). The
   fork changes them so a transcript missing from every project directory fails the resume for a
-  thread with T3 run history, which takes the fresh-session handoff. For the same reason the Claude
-  replay testkit (`ClaudeAdapterV2.testkit.ts`) writes a transcript for every session a recording
-  resumes.
+  thread with T3 run history, which takes the fresh-session handoff. A session id the same runtime
+  allocated (a new thread, or a rollback to thread start) is exempt, since Claude has not written
+  its transcript yet. After a restart that exemption is gone, so such a thread resumes through the
+  handoff. For the same reason the Claude replay testkit (`ClaudeAdapterV2.testkit.ts`) writes a
+  transcript for every session a recording resumes.
+- Claude's task lists under `<CLAUDE_CONFIG_DIR>/tasks/<session id>/`, which `readClaudeTaskList`
+  in the same file reads back.
 - `CLAUDE_CONFIG_DIR` resolution and the host session variables in
   [`ClaudeHome.ts`](../../apps/server/src/provider/Drivers/ClaudeHome.ts), and the claude-runner
   variable names stripped in `ClaudeProcessEnvironment.ts`. New runner variables need adding there.
-- The single `CentralState.supervise(config)` line in
-  [`cli/server.ts`](../../apps/server/src/cli/server.ts).
+- The `CentralState.supervise(config, { afterServerStop })` step in
+  [`cli/server.ts`](../../apps/server/src/cli/server.ts). Settings' Reclaim runs as
+  `afterServerStop`: it needs the snapshot loop's database reader closed, and its result is what
+  the final push saves.
 
 ## Data governance
 
@@ -324,7 +385,12 @@ Re-check these on every upstream merge. Central state relies on them without cha
   customer data. The store needs access control at least as strict as production read access.
 - Blobs hold plaintext signing keys. The database plus `server-signing-key` is enough to mint any
   session on that home.
+- Blobs also hold, in plaintext (only compressed), every source-control token and provider API key
+  entered in T3 settings, in every retained and pinned generation.
 - Deleting a thread is a soft delete. Its content stays in the database and in every retained
   generation and pinned generation. A purge request needs the whole home deleted from the store.
-- Pushes that crash or come from a fenced server leave orphan blobs. Nothing sweeps them in v1, so
-  the bucket's lifecycle policy must.
+- Pushes that crash or come from a fenced server, and garbage collection a holder skips when its
+  lease may have passed on, leave orphan blobs and history copies. v1 leaves them in place. Only a
+  reference-aware sweep may remove them: one that holds the lease, marks every blob the head, the
+  history copies and the pinned manifests reference, and deletes the rest. That sweep is future
+  work; an age-based lifecycle rule is not a substitute (see infra item 6).

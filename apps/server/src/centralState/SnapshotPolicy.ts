@@ -70,8 +70,10 @@ export const pushed = (
   finishedAt: number,
   outcome: "committed" | "unchanged" | "failed",
 ): PolicyState => {
+  // A failure's duration is how long the store took to fail, not what a push costs, so the spacing
+  // keeps the last successful push's duration.
+  if (outcome === "failed") return { ...s, lastPushStartedAt: startedAt };
   const timing = { lastPushStartedAt: startedAt, lastPushDurationMs: finishedAt - startedAt };
-  if (outcome === "failed") return { ...s, ...timing };
   const historyStillDirty = s.lastHistoryChangeAt !== null && s.lastHistoryChangeAt > startedAt;
   return {
     ...timing,

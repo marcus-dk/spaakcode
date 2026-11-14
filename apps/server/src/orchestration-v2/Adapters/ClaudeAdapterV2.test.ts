@@ -7777,6 +7777,13 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         rolledBack.providerThread.forkedFrom?.providerThreadId,
         providerThread.forkedFrom?.providerThreadId,
       );
+      if (headMessageId === undefined) {
+        // The orchestrator records the next run before it resumes; the new id has no transcript yet.
+        const resumed = yield* harness.runtime.resumeThread({
+          providerThread: { ...rolledBack.providerThread, firstRunOrdinal: 1, lastRunOrdinal: 1 },
+        });
+        assert.equal(resumed.nativeThreadRef?.nativeId, "fresh-native-session");
+      }
       yield* harness.runtime.startTurn({
         ...turnInput,
         attemptId: RunAttemptId.make("after-rollback"),

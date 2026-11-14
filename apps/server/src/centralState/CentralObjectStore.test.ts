@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off - a real HTTP server shows the framing on the wire.
+import * as NodeHttp from "node:http";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Context from "effect/Context";
@@ -304,6 +307,23 @@ it.layer(NodeServices.layer)("CentralObjectStore HTTP backend", (it) => {
     }),
   );
 
+  it.effect("refuses keys with dot segments before sending anything", () =>
+    Effect.gen(function* () {
+      const { store, requests } = yield* makeHttpStore({
+        respond: () => new Response(null, { status: 204 }),
+      });
+      for (const key of [
+        "homes/a/blobs/../../b/manifest.json",
+        "homes/a/./lease.json",
+        "homes//a",
+      ]) {
+        const error = yield* failureOf(store.remove(key));
+        assert.instanceOf(error, CentralObjectStore.CentralObjectStoreError, key);
+      }
+      assert.deepStrictEqual(requests, []);
+    }),
+  );
+
   it.effect("a transport failure is a store error with no status", () =>
     Effect.gen(function* () {
       const client = HttpClient.make((request) =>
@@ -327,3 +347,50 @@ it.layer(NodeServices.layer)("CentralObjectStore HTTP backend", (it) => {
     }),
   );
 });
+
+it.live("the undici HTTP backend sends a file body with its Content-Length, not chunked", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-central-http-" });
+    const file = path.join(directory, "blob.zst");
+    yield* fileSystem.writeFile(file, new Uint8Array(70_000).fill(7));
+    const seen: Array<{
+      readonly length: string | undefined;
+      readonly encoding: string | undefined;
+      readonly bytes: number;
+    }> = [];
+    const server = yield* Effect.acquireRelease(
+      Effect.callback<NodeHttp.Server>((resume) => {
+        const created = NodeHttp.createServer((request, response) => {
+          let bytes = 0;
+          request.on("data", (chunk: Buffer) => (bytes += chunk.length));
+          request.on("end", () => {
+            seen.push({
+              length: request.headers["content-length"],
+              encoding: request.headers["transfer-encoding"],
+              bytes,
+            });
+            response.writeHead(200, { etag: '"1"' }).end();
+          });
+        });
+        created.listen(0, "127.0.0.1", () => resume(Effect.succeed(created)));
+      }),
+      (created) =>
+        Effect.callback<void>((resume) => {
+          created.close(() => resume(Effect.void));
+        }),
+    );
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("no port");
+    const store = yield* buildStore(
+      CentralObjectStore.layerHttpUndici({
+        baseUrl: new URL(`http://127.0.0.1:${address.port}/v1/t3/objects`),
+        tokenFile: undefined,
+        preconditions: "etag",
+      }),
+    );
+    yield* store.write("homes/a/blobs/x", { _tag: "File", path: file }, IfAbsent);
+    assert.deepStrictEqual(seen, [{ length: "70000", encoding: undefined, bytes: 70_000 }]);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);

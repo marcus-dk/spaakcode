@@ -35,12 +35,35 @@ export class CentralStateLeaseHeldError extends Schema.TaggedError<CentralStateL
 
 export type LeaseLoss = "superseded" | "expired";
 
+export class CentralStateFencedError extends Schema.TaggedError<CentralStateFencedError>()(
+  "CentralStateFencedError",
+  { homeKey: Schema.String, reason: Schema.Literals(["superseded", "expired"]) },
+) {
+  // Only a superseded server must stay down; an expired lease is a store outage a restart outlives.
+  override readonly [Runtime.errorExitCode] =
+    this.reason === "superseded" ? SERVER_EXIT_CODE_STATE_DIR_OWNED : 1;
+
+  override get message(): string {
+    return this.reason === "superseded"
+      ? `Another server took over T3 home ${this.homeKey}, so this server stopped without saving again.`
+      : `T3 home ${this.homeKey} could not renew its lease in time, so this server stopped. Changes since the last save may be lost.`;
+  }
+}
+
 export interface HeldLease {
   readonly holderId: string;
   /** The record observed before acquiring. */
   readonly previous: Option.Option<typeof Manifest.LeaseRecord.Type>;
   readonly lost: Deferred.Deferred<LeaseLoss>;
-  readonly handoffRequested: Deferred.Deferred<{ readonly host: string; readonly pid: number }>;
+  /** Fails with CentralStateFencedError once the lease is lost. */
+  readonly ensureHeld: Effect.Effect<void, CentralStateFencedError>;
+  /** Time left before this holder must stop itself; 0 once lost. No taker steals before it ends. */
+  readonly remainingMs: Effect.Effect<number>;
+  /**
+   * Completes with a takeover request that is still in the lease record and younger than the
+   * requester's timeout, so a holder never hands off to a requester that gave up.
+   */
+  readonly awaitHandoff: Effect.Effect<{ readonly host: string; readonly pid: number }>;
   /** Interrupts renewal, then CAS-writes holder: null. No-op once lost. Errors are logged, never raised. */
   readonly release: Effect.Effect<void>;
 }
@@ -53,6 +76,9 @@ const BOOT_TIMEOUT_MS = 120_000;
 const BOOT_RETRY_MIN_MS = 1_000;
 const BOOT_RETRY_MAX_MS = 15_000;
 const RELEASE_RETRY = Duration.seconds(5);
+// One CAS attempt can outlast RELEASE_RETRY (a write and a read-back of up to 30 s each).
+const RELEASE_TIMEOUT = Duration.seconds(15);
+const RELEASE_ATTEMPTS = 3;
 
 // Every elapsed time is monotonic and every wait is Effect.sleep, so TestClock drives both.
 const monotonicMillis = Effect.map(Clock.monotonicTimeNanos, (nanos) => Number(nanos) / 1e6);
@@ -100,6 +126,30 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
       holderPid: holder.pid,
       holderStateDir: holder.stateDir,
     });
+
+  /** A requester that gives up takes its request back, so the holder never hands off to nobody. */
+  const withdrawRequest = Effect.gen(function* () {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const current = yield* readLease;
+      if (Option.isNone(current) || current.value.value.takeoverRequest?.holderId !== me.holderId) {
+        return;
+      }
+      const withdrawn = yield* Effect.result(
+        Manifest.casWrite({
+          key,
+          schema: Manifest.LeaseRecord,
+          value: {
+            ...current.value.value,
+            takeoverRequest: null,
+            writeNonce: NodeCrypto.randomUUID(),
+          },
+          precondition: { _tag: "IfVersion", version: current.value.version },
+          retryFor: renewEvery,
+        }),
+      );
+      if (Result.isSuccess(withdrawn) || withdrawn.failure._tag !== "CentralCasLostError") return;
+    }
+  }).pipe(Effect.ignore);
 
   const claim = Effect.fnUntraced(function* (
     previous: Option.Option<LeaseRecord>,
@@ -173,7 +223,10 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
         return Option.some(yield* claim(Option.some(record), { _tag: "IfVersion", version }));
       }
       const giveUpAt = requestedAt === undefined ? Infinity : requestedAt + TAKEOVER_TIMEOUT_MS;
-      if (now >= giveUpAt) return yield* heldError(holder);
+      if (now >= giveUpAt) {
+        yield* withdrawRequest;
+        return yield* heldError(holder);
+      }
       yield* Effect.sleep(Duration.millis(Math.min(pollMs, stealAt - now, giveUpAt - now)));
 
       const polled = yield* readLease;
@@ -212,21 +265,33 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
   });
 
   const lost = yield* Deferred.make<LeaseLoss>();
-  const handoffRequested = yield* Deferred.make<{ readonly host: string; readonly pid: number }>();
+  // Completed by renewals while the record carries a live request; replaced once one is withdrawn.
+  let handoffSignal = yield* Deferred.make<void>();
   let record = claimed.record;
   let version = claimed.version;
   let lastOk = claimed.startedAt;
 
   // `release` runs wherever the caller runs it, so it keeps the store it acquired with.
   const store = yield* CentralObjectStore.CentralObjectStore;
-  const casLease = (value: LeaseRecord, retryFor: Duration.Duration) =>
-    Manifest.casWrite({
-      key,
-      schema: Manifest.LeaseRecord,
-      value,
-      precondition: { _tag: "IfVersion", version },
-      retryFor,
-    }).pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, store));
+  const withStore = <A, E>(effect: Effect.Effect<A, E, CentralObjectStore.CentralObjectStore>) =>
+    effect.pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, store));
+  const casLease = (value: LeaseRecord, retryFor: Duration.Duration, atVersion = version) =>
+    withStore(
+      Manifest.casWrite({
+        key,
+        schema: Manifest.LeaseRecord,
+        value,
+        precondition: { _tag: "IfVersion", version: atVersion },
+        retryFor,
+      }),
+    );
+  const readRemote = withStore(Manifest.readJson(key, Manifest.LeaseRecord));
+
+  /** A request the requester still waits on: it withdraws its request when it gives up. */
+  const isLive = (request: LeaseRecord["takeoverRequest"], nowMs: number) =>
+    request !== null &&
+    request.holderId !== me.holderId &&
+    nowMs - Date.parse(request.requestedAt) < TAKEOVER_TIMEOUT_MS;
 
   // The self-fence deadline runs from the start of the last successful renew request, so a taker
   // that saw that write and waits 1.5·T leaves this holder 0.5·T to stop.
@@ -238,8 +303,13 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
       );
       roundAt = yield* monotonicMillis;
       if (roundAt - lastOk >= ttlMs) return yield* Deferred.succeed(lost, "expired");
+      // A request left by a requester that crashed must not stop a later, healthy holder.
+      const takeoverRequest = isLive(record.takeoverRequest, yield* Clock.currentTimeMillis)
+        ? record.takeoverRequest
+        : null;
       const value: LeaseRecord = {
         ...record,
+        takeoverRequest,
         renewedAt: yield* isoNow,
         headSequence: yield* input.heartbeat,
         writeNonce: NodeCrypto.randomUUID(),
@@ -260,14 +330,13 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
           if (current === undefined || current.value.holder?.holderId !== me.holderId) {
             return yield* Deferred.succeed(lost, "superseded");
           }
-          record = { ...record, takeoverRequest: current.value.takeoverRequest };
-          version = current.version;
           const request = current.value.takeoverRequest;
-          if (request !== null) {
-            yield* Deferred.succeed(handoffRequested, { host: request.host, pid: request.pid });
-          }
+          const live = isLive(request, yield* Clock.currentTimeMillis);
+          record = { ...record, takeoverRequest: live ? request : null };
+          version = current.version;
         }
       }
+      if (record.takeoverRequest !== null) yield* Deferred.succeed(handoffSignal, undefined);
       if ((yield* monotonicMillis) - lastOk >= ttlMs) {
         return yield* Deferred.succeed(lost, "expired");
       }
@@ -275,34 +344,83 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
   });
   const renewal = yield* Effect.forkScoped(renew);
 
+  const awaitHandoff = Effect.gen(function* () {
+    while (true) {
+      yield* Deferred.await(handoffSignal);
+      // The requester may have given up since a renewal saw its request.
+      const remote = yield* Effect.result(readRemote);
+      const current = Result.isSuccess(remote) ? Option.getOrUndefined(remote.success) : undefined;
+      const request = current?.value.takeoverRequest ?? null;
+      if (
+        request !== null &&
+        current?.value.holder?.holderId === me.holderId &&
+        isLive(request, yield* Clock.currentTimeMillis)
+      ) {
+        return { host: request.host, pid: request.pid };
+      }
+      handoffSignal = yield* Deferred.make<void>();
+    }
+  });
+
+  const warnRelease = (cause: unknown) =>
+    Effect.logWarning("Could not release the central state lease.").pipe(
+      Effect.annotateLogs({ homeKey: input.homeKey, cause }),
+    );
+
   let released = false;
   const release: Effect.Effect<void> = Effect.gen(function* () {
     if (released) return;
     released = true;
     yield* Fiber.interrupt(renewal);
     if (yield* Deferred.isDone(lost)) return;
-    const value: LeaseRecord = {
-      ...record,
-      holder: null,
-      takeoverRequest: null,
-      renewedAt: yield* isoNow,
-      headSequence: (yield* input.heartbeat) ?? record.headSequence,
-      writeNonce: NodeCrypto.randomUUID(),
-    };
-    yield* casLease(value, RELEASE_RETRY).pipe(
-      Effect.catch((error) =>
-        Effect.logWarning("Could not release the central state lease.").pipe(
-          Effect.annotateLogs({ homeKey: input.homeKey, cause: error }),
-        ),
-      ),
-    );
-  }).pipe(Effect.withSpan("CentralLease.release"));
+    let base = record;
+    let baseVersion = version;
+    for (let attempt = 1; ; attempt += 1) {
+      const value: LeaseRecord = {
+        ...base,
+        holder: null,
+        takeoverRequest: null,
+        renewedAt: yield* isoNow,
+        headSequence: (yield* input.heartbeat) ?? base.headSequence,
+        writeNonce: NodeCrypto.randomUUID(),
+      };
+      const written = yield* Effect.result(casLease(value, RELEASE_RETRY, baseVersion));
+      if (Result.isSuccess(written)) return;
+      if (written.failure._tag !== "CentralCasLostError" || attempt >= RELEASE_ATTEMPTS) {
+        return yield* warnRelease(written.failure);
+      }
+      // A renewal cut short by the interrupt can still land: follow the lease while it is ours.
+      const remote = yield* Effect.result(readRemote);
+      if (Result.isFailure(remote)) return yield* warnRelease(remote.failure);
+      const current = Option.getOrUndefined(remote.success);
+      if (current === undefined || current.value.holder?.holderId !== me.holderId) return;
+      base = current.value;
+      baseVersion = current.version;
+    }
+  }).pipe(
+    // Finalizers are uninterruptible; the timeout must still be able to cut a hung store short.
+    Effect.interruptible,
+    Effect.timeout(RELEASE_TIMEOUT),
+    Effect.catch(warnRelease),
+    Effect.withSpan("CentralLease.release"),
+  );
 
   const lease: HeldLease = {
     holderId: me.holderId,
     previous: claimed.previous,
     lost,
-    handoffRequested,
+    ensureHeld: Effect.gen(function* () {
+      if (!(yield* Deferred.isDone(lost))) return;
+      return yield* new CentralStateFencedError({
+        homeKey: input.homeKey,
+        reason: yield* Deferred.await(lost),
+      });
+    }),
+    remainingMs: Effect.gen(function* () {
+      if (yield* Deferred.isDone(lost)) return 0;
+      return Math.max(0, lastOk + ttlMs - (yield* monotonicMillis));
+    }),
+    awaitHandoff,
     release,
   };
   return lease;

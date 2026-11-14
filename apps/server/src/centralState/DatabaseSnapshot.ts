@@ -51,6 +51,8 @@ export class CentralStateMigrationRefusedError extends Schema.TaggedError<Centra
 export interface LiveReader {
   readonly dataVersion: Effect.Effect<number, CentralStateSnapshotError>;
   readonly headSequence: Effect.Effect<number, CentralStateSnapshotError>;
+  /** Changes when a session or pairing link is created, revoked, consumed or deleted. */
+  readonly authMarker: Effect.Effect<string, CentralStateSnapshotError>;
   readonly backupTo: (outPath: string) => Effect.Effect<void, CentralStateSnapshotError>;
 }
 
@@ -59,6 +61,17 @@ const MAX_SEQUENCE_SQL = `
     COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'orchestration_events'), 0),
     COALESCE((SELECT MAX(sequence) FROM orchestration_events), 0)
   ) AS sequence
+`;
+
+// A revocation or a redeemed single-use link that a lossy restore undid would work again.
+const AUTH_MARKER_SQL = `
+  SELECT
+    (SELECT COUNT(*) || ':' || COUNT(revoked_at) || ':' || IFNULL(MAX(revoked_at), '')
+       FROM auth_sessions)
+    || '|' ||
+    (SELECT COUNT(*) || ':' || COUNT(consumed_at) || ':' || COUNT(revoked_at) || ':' ||
+            IFNULL(MAX(consumed_at), '') || ':' || IFNULL(MAX(revoked_at), '')
+       FROM auth_pairing_links) AS marker
 `;
 
 const hasTable = (db: NodeSqlite.DatabaseSync, name: string) =>
@@ -119,6 +132,10 @@ export const openLiveReader = Effect.fn("DatabaseSnapshot.openLiveReader")(funct
   return Option.map(opened, (db): LiveReader => {
     const dataVersion = db.prepare("PRAGMA data_version");
     const headSequence = db.prepare(MAX_SEQUENCE_SQL);
+    const authMarker =
+      hasTable(db, "auth_sessions") && hasTable(db, "auth_pairing_links")
+        ? db.prepare(AUTH_MARKER_SQL)
+        : null;
     return {
       dataVersion: Effect.try({
         try: () => Number(dataVersion.get()?.data_version),
@@ -126,6 +143,10 @@ export const openLiveReader = Effect.fn("DatabaseSnapshot.openLiveReader")(funct
       }),
       headSequence: Effect.try({
         try: () => Number(headSequence.get()?.sequence ?? 0),
+        catch: fail("inspect"),
+      }),
+      authMarker: Effect.try({
+        try: () => String(authMarker?.get()?.marker ?? ""),
         catch: fail("inspect"),
       }),
       backupTo: (outPath) =>
@@ -152,16 +173,25 @@ export const backupClosed = Effect.fn("DatabaseSnapshot.backupClosed")(function*
   }).pipe(Effect.ensuring(Effect.sync(() => closeQuietly(db))));
 });
 
-export const inspect = Effect.fn("DatabaseSnapshot.inspect")(function* (path: string) {
+/**
+ * quick_check reads every page synchronously on the server's thread, about 2 s per GB, so pushes skip
+ * it: the online-backup API makes a consistent copy. Restore keeps it for downloaded bytes.
+ */
+export const inspect = Effect.fn("DatabaseSnapshot.inspect")(function* (
+  path: string,
+  options: { readonly quickCheck: boolean } = { quickCheck: true },
+) {
   return yield* Effect.try({
     try: () => {
       const db = new NodeSqlite.DatabaseSync(path, { readOnly: true });
       try {
-        const quickCheck = db
-          .prepare("PRAGMA quick_check")
-          .all()
-          .map((row) => String(row.quick_check))
-          .join("\n");
+        const quickCheck = options.quickCheck
+          ? db
+              .prepare("PRAGMA quick_check")
+              .all()
+              .map((row) => String(row.quick_check))
+              .join("\n")
+          : "skipped";
         return { migrations: readMigrations(db), maxSequence: readMaxSequence(db), quickCheck };
       } finally {
         closeQuietly(db);

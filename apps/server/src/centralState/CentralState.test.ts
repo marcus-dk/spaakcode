@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off - seeds and inspects T3 homes directly, and runs lease I/O synchronously.
 import * as NodeFS from "node:fs";
+import * as NodeSqlite from "node:sqlite";
 import * as NodeURL from "node:url";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -182,8 +183,12 @@ const setup = Effect.gen(function* () {
     config: ServerConfig.ServerConfig["Service"],
     server: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>,
     env: Record<string, string> = {},
+    options: CentralState.SuperviseOptions<never> = {},
   ) =>
-    CentralState.supervise(config)(server).pipe(
+    CentralState.supervise(
+      config,
+      options,
+    )(server).pipe(
       Effect.provide(
         ConfigProvider.layer(
           ConfigProvider.fromEnv({
@@ -230,7 +235,25 @@ const setup = Effect.gen(function* () {
     );
   });
 
-  return { home, wipe, supervise, lease, head, marker, supersede };
+  /** Another process fences the manifest without touching the lease. */
+  const fenceManifest = Effect.gen(function* () {
+    const current = yield* head();
+    return yield* withStore(
+      Manifest.casWrite({
+        key: Manifest.keys.head(homeKey),
+        schema: Manifest.Manifest,
+        value: {
+          ...current.manifest,
+          holder: { ...current.manifest.holder, holderId: "intruder", host: "elsewhere" },
+          writeNonce: "intruder",
+        },
+        precondition: { _tag: "IfVersion", version: current.version },
+        retryFor: Duration.zero,
+      }),
+    );
+  });
+
+  return { home, wipe, supervise, lease, head, marker, supersede, fenceManifest };
 });
 type Fixture = Effect.Success<typeof setup>;
 
@@ -352,6 +375,36 @@ it.layer(NodeServices.layer)("CentralState.supervise", (it) => {
     }),
   );
 
+  it.effect("keeps the lease when the handoff's final save fails", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const env = { T3CODE_CENTRAL_STATE_LEASE_TTL: "4s" };
+      const config = yield* fixture.home("home");
+      const hold = yield* makeHold;
+      const first = yield* fixture
+        .supervise(config, fakeServer(config, { write: ["event:1"], hold }), {
+          ...env,
+          // No time to save.
+          T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT: "0s",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(hold.serving);
+
+      yield* forkStarted(
+        fixture.supervise(config, fakeServer(config, { write: [] }), {
+          ...env,
+          T3CODE_CENTRAL_STATE_TAKEOVER: "true",
+        }),
+      );
+      yield* TestClock.adjust(Duration.seconds(1));
+      const unsaved = yield* failureOf(first);
+      assert.strictEqual(unsaved._tag, "CentralStateHandoffUnsavedError");
+      assert.isTrue(yield* Deferred.isDone(hold.interrupted));
+      // The requester must not restore an older save while it believes nothing was lost.
+      assert.isNotNull((yield* fixture.lease()).value.holder);
+    }),
+  );
+
   it.effect("fails fast against a live holder without takeover and leaves it serving", () =>
     Effect.gen(function* () {
       const fixture = yield* setup;
@@ -403,6 +456,67 @@ it.layer(NodeServices.layer)("CentralState.supervise", (it) => {
       assert.isTrue(yield* Deferred.isDone(hold.interrupted));
       assert.strictEqual((yield* fixture.head()).version, before.version);
       assert.strictEqual((yield* fixture.lease()).value.holder?.holderId, "intruder");
+    }),
+  );
+
+  it.effect("stops a server whose manifest another server fenced, without a release", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const config = yield* committedHome(fixture, "home");
+      const hold = yield* makeHold;
+      const server = yield* fixture
+        .supervise(config, fakeServer(config, { write: ["event:4"], hold }))
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(hold.serving);
+      const holderBefore = (yield* fixture.lease()).value.holder;
+      const fenced = yield* fixture.fenceManifest;
+
+      yield* TestClock.adjust(Duration.seconds(10 + 2));
+      const error = yield* failureOf(server);
+      assert.deepStrictEqual(
+        { tag: error._tag, reason: "reason" in error ? error.reason : null },
+        { tag: "CentralStateFencedError", reason: "superseded" },
+      );
+      assert.isTrue(yield* Deferred.isDone(hold.interrupted));
+      assert.strictEqual((yield* fixture.head()).version, fenced.version);
+      assert.strictEqual((yield* fixture.lease()).value.holder?.holderId, holderBefore?.holderId);
+    }),
+  );
+
+  it.effect("runs afterServerStop once the snapshot reader has closed", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const config = yield* fixture.home("home");
+      const hold = yield* makeHold;
+      let exclusive: boolean | undefined;
+      // What Settings' Reclaim needs: no other connection may hold the database open.
+      const afterServerStop = Effect.sync(() => {
+        const db = new NodeSqlite.DatabaseSync(config.dbPath);
+        try {
+          db.exec("PRAGMA busy_timeout = 0; PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE;");
+          db.exec("ROLLBACK");
+          exclusive = true;
+        } catch {
+          exclusive = false;
+        } finally {
+          db.close();
+        }
+      });
+      const server = yield* fixture
+        .supervise(
+          config,
+          fakeServer(config, { write: ["event:1"], hold }),
+          {},
+          { afterServerStop },
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(hold.serving);
+      // The loop's next poll opens its reader on the migrated database.
+      yield* TestClock.adjust(Duration.seconds(2));
+      yield* Deferred.succeed(hold.release, undefined);
+      yield* Fiber.join(server);
+      assert.isTrue(exclusive);
+      assert.isNull((yield* fixture.lease()).value.holder);
     }),
   );
 

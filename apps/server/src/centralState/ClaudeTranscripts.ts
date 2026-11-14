@@ -11,12 +11,10 @@ import type * as PlatformError from "effect/PlatformError";
 import type { CentralObjectStoreError } from "./CentralObjectStore.ts";
 import { TRANSCRIPT_MAX_CHUNKS, type TranscriptEntry } from "./Manifest.ts";
 import type { ClaudeHooks } from "./StateBundle.ts";
+import { isSafeRelativePath } from "./StateFiles.ts";
 
 const NEWLINE_SEARCH_BLOCK = 64 * 1024;
 const TAIL_BYTES = 4096;
-
-const isSafeRelativePath = (relativePath: string) =>
-  relativePath.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
 
 type Entry = typeof TranscriptEntry.Type;
 
@@ -52,17 +50,23 @@ const completeLinesEnd = Effect.fnUntraced(function* (file: FileSystem.File, siz
   return 0;
 });
 
-export const collect = Effect.fn("ClaudeTranscripts.collect")(function* (
-  input: Parameters<ClaudeHooks["collect"]>[0],
+/** The synced directories under the Claude home: transcripts, and the task lists sessions keep. */
+type Root = "projects" | "tasks";
+
+const collectRoot = Effect.fn("ClaudeTranscripts.collectRoot")(function* (
+  input: Omit<Parameters<ClaudeHooks["collect"]>[0], "previous"> & {
+    readonly root: Root;
+    readonly previous: Readonly<Record<string, Entry>>;
+  },
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const projectsDir = path.join(input.claudeHome, "projects");
+  const rootDir = path.join(input.claudeHome, input.root);
   // Not readDirectory's recursive mode: it descends into symlinked directories.
   const walk = (
     relativeDir: string,
   ): Effect.Effect<ReadonlyArray<string>, PlatformError.PlatformError> =>
-    fileSystem.readDirectoryEntries(path.join(projectsDir, ...relativeDir.split("/"))).pipe(
+    fileSystem.readDirectoryEntries(path.join(rootDir, ...relativeDir.split("/"))).pipe(
       Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed([])),
       Effect.flatMap((entries) =>
         Effect.forEach(entries, (entry) => {
@@ -83,12 +87,12 @@ export const collect = Effect.fn("ClaudeTranscripts.collect")(function* (
       Option.Option<Entry>,
       CentralObjectStoreError | PlatformError.PlatformError
     > {
-      const absolutePath = path.join(projectsDir, ...relativePath.split("/"));
+      const absolutePath = path.join(rootDir, ...relativePath.split("/"));
       const info = yield* fileSystem.lstat(absolutePath);
       if (info.type !== "File") return Option.none();
       const size = Number(info.size);
       const mtimeMs = Option.getOrUndefined(info.mtime)?.getTime() ?? 0;
-      const previous = input.previous.files[relativePath];
+      const previous = input.previous[relativePath];
       if (previous !== undefined && previous.size === size && previous.mtimeMs === mtimeMs) {
         return Option.some(previous);
       }
@@ -134,7 +138,20 @@ export const collect = Effect.fn("ClaudeTranscripts.collect")(function* (
   for (const [index, entry] of collected.entries()) {
     if (Option.isSome(entry)) files[relativePaths[index]!] = entry.value;
   }
-  return { files };
+  return files;
+});
+
+export const collect = Effect.fn("ClaudeTranscripts.collect")(function* (
+  input: Parameters<ClaudeHooks["collect"]>[0],
+) {
+  const files = yield* collectRoot({ ...input, root: "projects", previous: input.previous.files });
+  // Claude's TaskGet and TaskUpdate read <claudeHome>/tasks/<session id> back on resume.
+  const tasks = yield* collectRoot({
+    ...input,
+    root: "tasks",
+    previous: input.previous.tasks ?? {},
+  });
+  return Object.keys(tasks).length === 0 ? { files } : { files, tasks };
 });
 
 export const stage = Effect.fn("ClaudeTranscripts.stage")(function* (
@@ -142,17 +159,24 @@ export const stage = Effect.fn("ClaudeTranscripts.stage")(function* (
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const entries = Object.entries(input.section.files).filter(([relativePath]) =>
-    isSafeRelativePath(relativePath),
+  const entries = (
+    [
+      ["projects", input.section.files],
+      ["tasks", input.section.tasks ?? {}],
+    ] as const
+  ).flatMap(([root, files]) =>
+    Object.entries(files)
+      .filter(([relativePath]) => isSafeRelativePath(relativePath))
+      .map(([relativePath, entry]) => ({ root, relativePath, entry })),
   );
-  const staged = (relativePath: string) =>
-    path.join(input.stagingDir, "projects", ...relativePath.split("/"));
+  const staged = (root: Root, relativePath: string) =>
+    path.join(input.stagingDir, root, ...relativePath.split("/"));
 
   yield* Effect.forEach(
     entries,
-    ([relativePath, entry]) =>
+    ({ root, relativePath, entry }) =>
       Effect.gen(function* () {
-        const destinationPath = staged(relativePath);
+        const destinationPath = staged(root, relativePath);
         if (entry.chunks.length === 0) {
           yield* fileSystem.makeDirectory(path.dirname(destinationPath), { recursive: true });
           yield* fileSystem.writeFile(destinationPath, new Uint8Array());
@@ -166,10 +190,10 @@ export const stage = Effect.fn("ClaudeTranscripts.stage")(function* (
   );
 
   const place = Effect.gen(function* () {
-    for (const [relativePath, entry] of entries) {
-      const target = path.join(input.claudeHome, "projects", ...relativePath.split("/"));
+    for (const { root, relativePath, entry } of entries) {
+      const target = path.join(input.claudeHome, root, ...relativePath.split("/"));
       yield* fileSystem.makeDirectory(path.dirname(target), { recursive: true });
-      yield* fileSystem.rename(staged(relativePath), target);
+      yield* fileSystem.rename(staged(root, relativePath), target);
       // A Date, not a number: Node reads numbers as seconds, and float seconds lose the exact milliseconds.
       const mtime = DateTime.toDate(DateTime.makeUnsafe(entry.mtimeMs));
       yield* fileSystem.utimes(target, mtime, mtime);

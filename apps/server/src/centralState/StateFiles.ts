@@ -42,12 +42,23 @@ type CacheEntry = {
   readonly entry: typeof StateFileEntry.Type;
 };
 
+/**
+ * Pure. True when a "/"-separated key from a manifest stays inside the directory it is joined to:
+ * no empty, "." or ".." segment, and no "\\", ":" or NUL, which Windows paths read as separators or
+ * drives.
+ */
+export const isSafeRelativePath = (relativePath: string): boolean =>
+  relativePath
+    .split("/")
+    .every(
+      (segment) =>
+        segment !== "" && segment !== "." && segment !== ".." && !/[\\:\0]/.test(segment),
+    );
+
 /** Pure. relativePath is under stateDir with "/" separators. */
 export const isSynced = (relativePath: string): boolean => {
+  if (!isSafeRelativePath(relativePath)) return false;
   const segments = relativePath.split("/");
-  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
-    return false;
-  }
   const [root = "", ...rest] = segments;
   const name = rest.at(-1);
   if (name === undefined) return SYNCED_FILES.has(root);
@@ -80,8 +91,9 @@ export const scan = Effect.fn("StateFiles.scan")(function* (input: {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const absolute = (relativePath: string) => path.join(input.stateDir, ...relativePath.split("/"));
+  // lstat: a symlink is never synced, so nothing outside the home is uploaded through one.
   const stat = (relativePath: string) =>
-    fs.stat(absolute(relativePath)).pipe(
+    fs.lstat(absolute(relativePath)).pipe(
       Effect.map((info) =>
         info.type === "File"
           ? Option.some({
@@ -93,14 +105,22 @@ export const scan = Effect.fn("StateFiles.scan")(function* (input: {
       Effect.catchReason("PlatformError", "NotFound", () => Effect.succeedNone),
     );
 
-  const nested = yield* Effect.forEach(SYNCED_DIRECTORIES, (directory) =>
-    fs.readDirectory(absolute(directory), { recursive: true }).pipe(
-      Effect.map((entries) =>
-        entries.map((entry) => `${directory}/${entry.split(path.sep).join("/")}`),
-      ),
+  // Not readDirectory's recursive mode: it descends into symlinked directories.
+  const walk = (
+    relativeDir: string,
+  ): Effect.Effect<ReadonlyArray<string>, PlatformError.PlatformError> =>
+    fs.readDirectoryEntries(absolute(relativeDir)).pipe(
       Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed([])),
-    ),
-  );
+      Effect.flatMap((entries) =>
+        Effect.forEach(entries, (entry) => {
+          const relativePath = `${relativeDir}/${entry.name}`;
+          if (entry.type === "Directory") return walk(relativePath);
+          return Effect.succeed(entry.type === "File" ? [relativePath] : []);
+        }),
+      ),
+      Effect.map((nested) => nested.flat()),
+    );
+  const nested = yield* Effect.forEach(SYNCED_DIRECTORIES, walk);
   const candidates = [...SYNCED_FILES, ...nested.flat()].filter(isSynced).sort();
 
   const scanned = yield* Effect.forEach(

@@ -195,6 +195,13 @@ describe("CentralLease", () => {
         assert.strictEqual((yield* failureOf(requester))._tag, "CentralStateLeaseHeldError");
         assert.strictEqual(yield* holderIdOf(store), "a");
         assert.isFalse(yield* Deferred.isDone(a.lost));
+
+        // It takes its request back, so a holder that only now looks never hands off to nobody.
+        assert.isNull((yield* readLease(store)).value.takeoverRequest);
+        const handoff = yield* Effect.forkChild(a.awaitHandoff);
+        yield* TestClock.adjust(Duration.millis(ttlMs / 2));
+        assert.isUndefined(handoff.pollUnsafe());
+        assert.isNull((yield* readLease(store)).value.takeoverRequest);
       }),
     ),
   );
@@ -206,7 +213,7 @@ describe("CentralLease", () => {
         const a = yield* acquire(store, holder("a"));
         const requester = yield* Effect.forkChild(acquire(store, holder("b"), true));
         yield* TestClock.adjust(Duration.millis(ttlMs / 4));
-        assert.deepStrictEqual(yield* Deferred.await(a.handoffRequested), {
+        assert.deepStrictEqual(yield* a.awaitHandoff, {
           host: "host-b",
           pid: process.pid,
         });
@@ -218,6 +225,27 @@ describe("CentralLease", () => {
         assert.strictEqual(Option.getOrThrow(b.previous).holder, null);
         assert.strictEqual(yield* holderIdOf(store), "b");
         assert.isFalse(yield* Deferred.isDone(a.lost));
+      }),
+    ),
+  );
+
+  it.effect("releases a lease whose interrupted renewal still landed", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const store = makeStore();
+        const a = yield* acquire(store, holder("a"));
+        // The renewal's PUT reaches the store after release interrupted it.
+        const current = yield* readLease(store);
+        yield* Manifest.casWrite({
+          key,
+          schema: Manifest.LeaseRecord,
+          value: { ...current.value, writeNonce: "late-renewal" },
+          precondition: { _tag: "IfVersion", version: current.version },
+          retryFor: Duration.zero,
+        }).pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, store));
+
+        yield* a.release;
+        assert.isNull(yield* holderIdOf(store));
       }),
     ),
   );

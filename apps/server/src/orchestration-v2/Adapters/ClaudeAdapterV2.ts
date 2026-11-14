@@ -5613,6 +5613,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           );
         });
         const openedNativeThreads = yield* Ref.make(new Set<string>());
+        // Session ids this runtime allocated (a new thread, or a rollback to thread start). Claude
+        // may not have written their transcript yet, so its absence loses no conversation.
+        const allocatedNativeThreads = yield* Ref.make(new Set<string>());
         const pdfBudgets = new Map<string, ReturnType<typeof makeClaudeAttachmentBudget>>();
         const latestPlanByKind = yield* Ref.make(new Map<string, OrchestrationV2PlanArtifact>());
         // Claude 5 task tools edit one list per native session, across turns.
@@ -13195,6 +13198,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             function* (threadInput: ProviderAdapter.ProviderAdapterV2EnsureThreadInput) {
               const createdAt = yield* DateTime.now;
               const nativeThreadId = yield* queryRunner.allocateSessionId;
+              yield* Ref.update(allocatedNativeThreads, (current) =>
+                new Set(current).add(nativeThreadId),
+              );
               return makeProviderThread({
                 idAllocator,
                 providerInstanceId: adapterOptions.instanceId,
@@ -13231,7 +13237,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 );
                 if (
                   transcript === "empty" ||
-                  (transcript === "absent" && threadInput.providerThread.lastRunOrdinal !== null)
+                  (transcript === "absent" &&
+                    threadInput.providerThread.lastRunOrdinal !== null &&
+                    !(yield* Ref.get(allocatedNativeThreads)).has(nativeThreadId))
                 ) {
                   return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                     driver: CLAUDE_PROVIDER,
@@ -13578,6 +13586,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
 
               if (rollbackInput.target.type === "thread_start" && resumeSessionAt === null) {
                 const resetNativeThreadId = yield* queryRunner.allocateSessionId;
+                yield* Ref.update(allocatedNativeThreads, (current) =>
+                  new Set(current).add(resetNativeThreadId),
+                );
                 return {
                   providerThread: {
                     ...makeProviderThread({
