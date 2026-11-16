@@ -19,7 +19,10 @@ import * as SnapshotPolicy from "./SnapshotPolicy.ts";
 import * as StateBundle from "./StateBundle.ts";
 
 export interface SnapshotLoop {
-  /** Completed when a push loses the manifest CAS: another server owns the home now. */
+  /**
+   * Completed when a push loses the manifest CAS or the broker refuses this generation: another
+   * server owns the home now.
+   */
   readonly fenced: Deferred.Deferred<void>;
   /**
    * Waits up to finalPushTimeout for a live push, then stops the loop, cutting that push short (each
@@ -43,6 +46,9 @@ const outcomeKind = (outcome: StateBundle.PushOutcome) =>
     : outcome._tag === "Unchanged"
       ? "unchanged"
       : "failed";
+
+const isFence = (error: { readonly _tag: string }) =>
+  error._tag === "CentralCasLostError" || error._tag === "CentralObjectFencedError";
 
 /** An adopted head is a base, not a save of this push. */
 class AdoptedOwnCommit {
@@ -98,7 +104,7 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
       return outcome;
     },
     Effect.tapError((error) =>
-      error._tag === "CentralCasLostError" ? Deferred.succeed(fenced, undefined) : Effect.void,
+      isFence(error) ? Deferred.succeed(fenced, undefined) : Effect.void,
     ),
   );
 
@@ -175,7 +181,7 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
             );
             return true;
           }
-          if (outcome.failure._tag === "CentralCasLostError") return false;
+          if (isFence(outcome.failure)) return false;
           yield* warn("Central state push failed; retrying later.", outcome.failure);
           policy = SnapshotPolicy.pushed(policy, startedAt, finishedAt, "failed");
           return true;
@@ -214,7 +220,7 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
     finalAttempt.pipe(
       Effect.retry({
         schedule: Schedule.exponential(FINAL_PUSH_RETRY),
-        while: (error) => error._tag !== "CentralCasLostError",
+        while: (error) => !isFence(error),
       }),
       Effect.as(true),
       // Finalizers are uninterruptible; the timeout must still be able to cut the push short.

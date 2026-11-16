@@ -4,6 +4,7 @@ import * as SnapshotPolicy from "./SnapshotPolicy.ts";
 
 const cfg: SnapshotPolicy.PolicyConfig = {
   debounceMs: 10_000,
+  minSpacingMs: 30_000,
   maxIntervalMs: 120_000,
   idleIntervalMs: 600_000,
 };
@@ -25,6 +26,7 @@ it("decide", () => {
     readonly state: SnapshotPolicy.PolicyState;
     readonly now: number;
     readonly expected: "push" | "wait";
+    readonly config?: SnapshotPolicy.PolicyConfig;
   }> = [
     {
       name: "never pushed pushes at once",
@@ -71,8 +73,26 @@ it("decide", () => {
     {
       name: "spacing is at least 30 s after a fast push",
       state: SnapshotPolicy.observe(clean, T0 + 1, history),
-      now: T0 + SnapshotPolicy.MIN_SPACING_MS - 1,
+      now: T0 + cfg.minSpacingMs - 1,
       expected: "wait",
+    },
+    {
+      name: "a configured spacing replaces the 30 s floor",
+      state: SnapshotPolicy.observe(clean, T0 + 1, history),
+      now: T0 + cfg.minSpacingMs - 1,
+      expected: "push",
+      config: { ...cfg, minSpacingMs: 5_000 },
+    },
+    {
+      name: "a configured spacing keeps 20 × a slow push's duration",
+      state: SnapshotPolicy.observe(
+        SnapshotPolicy.pushed(SnapshotPolicy.initial(false), T0, T0 + 5_000, "committed"),
+        T0 + 5_000,
+        history,
+      ),
+      now: T0 + 99_999,
+      expected: "wait",
+      config: { ...cfg, minSpacingMs: 5_000 },
     },
     {
       name: "spacing is 20 × a slow push's duration",
@@ -102,7 +122,11 @@ it("decide", () => {
     },
   ];
   for (const row of rows) {
-    assert.strictEqual(SnapshotPolicy.decide(row.state, row.now, cfg), row.expected, row.name);
+    assert.strictEqual(
+      SnapshotPolicy.decide(row.state, row.now, row.config ?? cfg),
+      row.expected,
+      row.name,
+    );
   }
 
   // Writes every debounce/2 never let the debounce elapse, so maxInterval forces the push.

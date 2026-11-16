@@ -181,7 +181,7 @@ describe("t3 server command safety", () => {
     ),
   );
 
-  it.effect("does not offer auto-bootstrap in serve help, since serve never bootstraps", () =>
+  it.effect("does not offer auto-bootstrap in serve help", () =>
     Effect.gen(function* () {
       yield* runCli(["serve", "--help"]);
       const help = (yield* TestConsole.logLines).join("\n");

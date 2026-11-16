@@ -11,7 +11,7 @@ import {
 } from "../attachmentStore.ts";
 import { DPOP_REPLAY_MARKER_PREFIX } from "../auth/dpop.ts";
 import { CLOUD_REPLAY_MARKER_PREFIXES } from "../cloud/CloudLink.ts";
-import type { CentralObjectStoreError } from "./CentralObjectStore.ts";
+import type { CentralObjectFencedError, CentralObjectStoreError } from "./CentralObjectStore.ts";
 import type { BlobRef, StateFileEntry } from "./Manifest.ts";
 
 const SYNCED_FILES = new Set([
@@ -86,7 +86,10 @@ export const scan = Effect.fn("StateFiles.scan")(function* (input: {
   readonly cache: Map<string, CacheEntry>;
   readonly upload: (
     path: string,
-  ) => Effect.Effect<typeof BlobRef.Type, CentralObjectStoreError | PlatformError.PlatformError>;
+  ) => Effect.Effect<
+    typeof BlobRef.Type,
+    CentralObjectStoreError | CentralObjectFencedError | PlatformError.PlatformError
+  >;
 }) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;

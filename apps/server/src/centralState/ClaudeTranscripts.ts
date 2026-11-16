@@ -8,7 +8,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
 
-import type { CentralObjectStoreError } from "./CentralObjectStore.ts";
+import type { CentralObjectFencedError, CentralObjectStoreError } from "./CentralObjectStore.ts";
 import { TRANSCRIPT_MAX_CHUNKS, type TranscriptEntry } from "./Manifest.ts";
 import type { ClaudeHooks } from "./StateBundle.ts";
 import { isSafeRelativePath } from "./StateFiles.ts";
@@ -85,7 +85,7 @@ const collectRoot = Effect.fn("ClaudeTranscripts.collectRoot")(function* (
       relativePath: string,
     ): Effect.fn.Return<
       Option.Option<Entry>,
-      CentralObjectStoreError | PlatformError.PlatformError
+      CentralObjectStoreError | CentralObjectFencedError | PlatformError.PlatformError
     > {
       const absolutePath = path.join(rootDir, ...relativePath.split("/"));
       const info = yield* fileSystem.lstat(absolutePath);

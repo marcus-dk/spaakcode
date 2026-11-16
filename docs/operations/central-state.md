@@ -62,7 +62,10 @@ Central state is configured through environment variables only. There are no CLI
 | `T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS` | `etag`                      | `etag` (the Spaak broker, or another Bearer-token gateway) or `gcs` (GCS XML API, which uses `x-goog-generation`). S3, R2 and MinIO need SigV4 and are not supported    |
 | `T3CODE_CENTRAL_STATE_CLAUDE_HOME`        | `<baseDir>/claude`          | Absolute path. T3's Claude children use it as `CLAUDE_CONFIG_DIR`                                                                                                       |
 | `T3CODE_CENTRAL_STATE_TAKEOVER`           | `false`                     | Ask a live holder to hand off instead of failing fast                                                                                                                   |
+| `T3CODE_CENTRAL_STATE_GENERATION`         | unset                       | Positive integer the session service gives each new pod of a home. See [Generations](#generations)                                                                      |
+| `T3CODE_CENTRAL_STATE_PUBLIC_URL`         | unset                       | The URL clients reach this server at. Only logged at startup, as `Serving T3 home <key> at <url>.`; pairing links are unchanged                                         |
 | `T3CODE_CENTRAL_STATE_DEBOUNCE`           | `10s`                       | Quiet time after the last history write before a push                                                                                                                   |
+| `T3CODE_CENTRAL_STATE_MIN_SPACING`        | `30s`                       | Floor on the time between push starts; values below `2s` are raised to `2s`. See [Recovery point](#recovery-point)                                                      |
 | `T3CODE_CENTRAL_STATE_MAX_INTERVAL`       | `2m`                        | Longest a history-dirty home waits during continuous activity                                                                                                           |
 | `T3CODE_CENTRAL_STATE_IDLE_INTERVAL`      | `10m`                       | Cadence for non-history DB writes and the files-only sweep                                                                                                              |
 | `T3CODE_CENTRAL_STATE_LEASE_TTL`          | `60s`                       | Lease lifetime. The holder renews every quarter of it and stops itself after a full TTL without a renewal                                                               |
@@ -102,9 +105,10 @@ otherwise its threads point at a missing directory.
 | Store or broker outage                                                                                                                        | Pushes retry. After `leaseTtl` (60 s) with no renewal, T3 stops itself. A restart in the same pod keeps the local home, so nothing is lost once the store answers again |
 | This server is superseded (another pod took the lease)                                                                                        | Everything since this server's last commit, by design                                                                                                                   |
 
-Pushes are spaced at least `max(30 s, 20 × the last successful push's duration)` apart, so
-snapshot work stays near 5% of one core. On a large database that spacing, not `maxInterval`, sets
-the loss window. A failed push only restarts the 30 s floor, so an outage does not stretch it.
+Pushes are spaced at least `max(minSpacing, 20 × the last successful push's duration)` apart
+(`minSpacing` is 30 s by default), so snapshot work stays near 5% of one core. On a large database
+that spacing, not `maxInterval`, sets the loss window. A failed push only restarts the `minSpacing`
+floor, so an outage does not stretch it.
 
 Session and pairing-link changes (pairing, revoking a device, redeeming a single-use link) are
 pushed on the history cadence, not the idle one. A lossy restore can still undo one made in the
@@ -167,9 +171,25 @@ A server that loses its lease stops itself with `CentralStateFencedError`, with 
 no release. A server whose lease lapses while it boots stops the same way, before it writes the
 head or moves local files.
 
-- `superseded` (exit code 78): another process took the lease or fenced the manifest.
+- `superseded` (exit code 78): another process took the lease or fenced the manifest, or the
+  broker refused this server's generation.
 - `expired` (exit code 1, so supervisors restart it): renewals failed for a full `leaseTtl`,
   usually because the store, broker or token was unavailable.
+
+### Generations
+
+With one home per work session, the session service outside T3 creates the pods and gives each new
+pod of a session a strictly higher `T3CODE_CENTRAL_STATE_GENERATION`. The lease records it on the
+holder, and the manifest's `holder` carries it. When both the holder and the new server have a
+generation:
+
+- a holder with a **lower** generation is taken over at once, with no 1.5 × `leaseTtl` wait, because
+  the broker already refuses the older pod;
+- a holder with a **higher** generation stops the new server at once with `CentralStateFencedError`
+  (`superseded`, exit code 78): it is the stale pod.
+
+An equal generation, or none on either side, keeps the behaviour above. Older builds ignore the
+field.
 
 A head write that landed after it looked failed, or a push cut short at shutdown, is not a fence:
 the next push finds this server's own commit at the head, adopts it and logs `Adopted an
@@ -184,6 +204,9 @@ export T3CODE_HOME=/tmp/t3 T3CODE_CENTRAL_STATE_URL=http://session-broker.claude
 export T3CODE_CENTRAL_STATE_HOME_KEY=<dev-id> T3CODE_CENTRAL_STATE_TOKEN_FILE=$SESSION_ENV_DIR/token
 export T3CODE_TELEMETRY_ENABLED=false T3CODE_HOST_ID=spaak-<dev-id> IS_SANDBOX=1 NODE_OPTIONS=--max-old-space-size=3072
 export CLAUDE_CODE_OAUTH_TOKEN=<per-developer>
+# One home per work session: the session service supplies these.
+# export T3CODE_CENTRAL_STATE_HOME_KEY=<session-id> T3CODE_CENTRAL_STATE_GENERATION=<n>
+# export T3CODE_CENTRAL_STATE_PUBLIC_URL=https://t3-<session>.sessions.<domain>
 t3 serve --host 0.0.0.0 --port 3773 & echo $! > /tmp/t3.pid
 ```
 
@@ -222,7 +245,12 @@ This repo cannot provide these. spaak-infra must:
      as deleted, and garbage collection would leak storage without a warning;
    - streams PUT bodies up to 5 GiB, which arrive with `Content-Length`, with request timeouts of
      at least 10 min;
-   - runs at least 2 replicas. A broker outage longer than `leaseTtl` stops every T3 server.
+   - runs at least 2 replicas. A broker outage longer than `leaseTtl` stops every T3 server;
+   - with generations, reads `x-t3-generation`, which T3 sends on every request when
+     `T3CODE_CENTRAL_STATE_GENERATION` is set, and refuses a request from a generation older than the
+     session's current one with 409 or 403 and `x-t3-fenced: 1`. T3 never retries that answer. The
+     lease renewal and every push treat it as `superseded`, and the server stops without a final push
+     or release. Without the header, 409 on PUT is a precondition failure and 403 is a store error.
 2. **Token refresher.** Keep `$SESSION_ENV_DIR/token` valid for at least `leaseTtl` + 60 s while T3
    runs, whether or not Claude is active. Today the file is refreshed only when Claude runs a Bash
    command (`/etc/claude/session-env.sh`). The alternative is a long-lived per-home credential from
@@ -302,7 +330,8 @@ Ranked by how likely each is to bite a team, worst first.
 
 ## Operations
 
-**Read the logs.** At startup the server logs the home key and the store host once. A restore logs:
+**Read the logs.** At startup the server logs the home key, the store host and the generation once,
+and `Serving T3 home <key> at <url>.` when `T3CODE_CENTRAL_STATE_PUBLIC_URL` is set. A restore logs:
 
 ```text
 Restored T3 home <key> generation <g> (written <age> ago by <host>);
@@ -311,7 +340,7 @@ at least <n> committed events after it were lost.
 
 The second clause appears only when the lease's last reported event head proves a loss. A
 self-fence ends the server with `CentralStateFencedError` and its reason. Failed pushes log a
-warning with the error tag and retry once the push spacing (at least 30 s) has passed. A store
+warning with the error tag and retry once the push spacing (at least `minSpacing`) has passed. A store
 error during boot is retried for up to 120 s.
 
 **Recover set-aside files.** Restore moves what it replaces aside instead of deleting it:

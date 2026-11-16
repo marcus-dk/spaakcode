@@ -46,6 +46,16 @@ export class CentralObjectStoreError extends Schema.TaggedError<CentralObjectSto
   }
 }
 
+/** The broker refused this server's session generation: a newer pod of the session holds the home. */
+export class CentralObjectFencedError extends Schema.TaggedError<CentralObjectFencedError>()(
+  "CentralObjectFencedError",
+  { key: Schema.String, status: Schema.Number },
+) {
+  override get message(): string {
+    return `The central state broker refused ${this.key} (HTTP ${this.status}): a newer generation of this session holds the home.`;
+  }
+}
+
 type Operation = CentralObjectStoreError["operation"];
 
 export type WriteBody =
@@ -63,23 +73,25 @@ export class CentralObjectStore extends Context.Service<
       key: string,
     ) => Effect.Effect<
       Option.Option<{ readonly bytes: Uint8Array; readonly version: string }>,
-      CentralObjectStoreError
+      CentralObjectStoreError | CentralObjectFencedError
     >;
     /** Streams the stored bytes to destinationPath; false when absent. */
     readonly download: (
       key: string,
       destinationPath: string,
-    ) => Effect.Effect<boolean, CentralObjectStoreError>;
+    ) => Effect.Effect<boolean, CentralObjectStoreError | CentralObjectFencedError>;
     readonly write: (
       key: string,
       body: WriteBody,
       precondition: WritePrecondition,
     ) => Effect.Effect<
       { readonly version: string },
-      CentralObjectStoreError | CentralObjectPreconditionError
+      CentralObjectStoreError | CentralObjectPreconditionError | CentralObjectFencedError
     >;
     /** Absent is success. */
-    readonly remove: (key: string) => Effect.Effect<void, CentralObjectStoreError>;
+    readonly remove: (
+      key: string,
+    ) => Effect.Effect<void, CentralObjectStoreError | CentralObjectFencedError>;
   }
 >()("t3/centralState/CentralObjectStore") {}
 
@@ -275,6 +287,7 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
   readonly baseUrl: URL;
   readonly tokenFile: string | undefined;
   readonly preconditions: "etag" | "gcs";
+  readonly generation: number | undefined;
 }) {
   const client = yield* HttpClient.HttpClient;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -294,16 +307,19 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
     return Effect.succeed(url);
   };
 
-  const authorization = (operation: Operation, key: string) => {
+  const generationHeader: Record<string, string> =
+    options.generation === undefined ? {} : { "x-t3-generation": String(options.generation) };
+
+  const requestHeaders = (operation: Operation, key: string) => {
     const tokenFile = options.tokenFile;
-    if (tokenFile === undefined) return Effect.succeed({});
+    if (tokenFile === undefined) return Effect.succeed(generationHeader);
     return fileSystem.readFileString(tokenFile).pipe(
       Effect.mapError((cause) => storeError(operation, key, cause)),
       Effect.flatMap((contents) => {
         const token = contents.trim();
         return token === ""
           ? Effect.fail(storeError(operation, key, new Error("The token file is empty.")))
-          : Effect.succeed({ authorization: `Bearer ${token}` });
+          : Effect.succeed({ ...generationHeader, authorization: `Bearer ${token}` });
       }),
     );
   };
@@ -327,6 +343,9 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
   const drain = (response: HttpClientResponse.HttpClientResponse) =>
     Effect.ignore(response.arrayBuffer);
 
+  const isFenced = (response: HttpClientResponse.HttpClientResponse) =>
+    (response.status === 403 || response.status === 409) && response.headers["x-t3-fenced"] === "1";
+
   const unexpectedStatus = (
     operation: Operation,
     key: string,
@@ -335,7 +354,14 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
     drain(response).pipe(
       Effect.andThen(
         Effect.fail(
-          storeError(operation, key, `Unexpected HTTP status ${response.status}.`, response.status),
+          isFenced(response)
+            ? new CentralObjectFencedError({ key, status: response.status })
+            : storeError(
+                operation,
+                key,
+                `Unexpected HTTP status ${response.status}.`,
+                response.status,
+              ),
         ),
       ),
     );
@@ -354,7 +380,11 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
   // Lower-level failures become transport errors with no status; domain errors pass through.
   const transportFailure =
     (operation: Operation, key: string) =>
-    <A, E extends CentralObjectStoreError | CentralObjectPreconditionError, R>(
+    <
+      A,
+      E extends CentralObjectStoreError | CentralObjectPreconditionError | CentralObjectFencedError,
+      R,
+    >(
       effect: Effect.Effect<A, E | LowerLevelFailure, R>,
     ) =>
       effect.pipe(
@@ -367,7 +397,7 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
     read: Effect.fn("CentralObjectStore.http.read")(
       function* (key) {
         const url = yield* objectUrl("read", key);
-        const headers = yield* authorization("read", key);
+        const headers = yield* requestHeaders("read", key);
         const response = yield* client.execute(HttpClientRequest.get(url, { headers }));
         if (response.status === 404) {
           yield* drain(response);
@@ -383,7 +413,7 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
     download: Effect.fn("CentralObjectStore.http.download")(
       function* (key, destinationPath) {
         const url = yield* objectUrl("download", key);
-        const headers = yield* authorization("download", key);
+        const headers = yield* requestHeaders("download", key);
         const response = yield* client.execute(HttpClientRequest.get(url, { headers }));
         if (response.status === 404) {
           yield* drain(response);
@@ -404,7 +434,7 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
       function* (key, body, precondition) {
         const url = yield* objectUrl("write", key);
         const headers = {
-          ...(yield* authorization("write", key)),
+          ...(yield* requestHeaders("write", key)),
           ...preconditionHeaders(precondition),
         };
         const base = HttpClientRequest.put(url, { headers });
@@ -416,7 +446,7 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
               }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
         const send = client.execute(request);
         const response = yield* body._tag === "Bytes" ? Effect.timeout(send, BYTES_TIMEOUT) : send;
-        if (response.status === 412 || response.status === 409) {
+        if (!isFenced(response) && (response.status === 412 || response.status === 409)) {
           yield* drain(response);
           return yield* new CentralObjectPreconditionError({ key });
         }
@@ -432,7 +462,7 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
     remove: Effect.fn("CentralObjectStore.http.remove")(
       function* (key) {
         const url = yield* objectUrl("remove", key);
-        const headers = yield* authorization("remove", key);
+        const headers = yield* requestHeaders("remove", key);
         const response = yield* client.execute(HttpClientRequest.delete(url, { headers }));
         if (
           response.status !== 200 &&
@@ -451,12 +481,15 @@ const makeHttp = Effect.fn("CentralObjectStore.makeHttp")(function* (options: {
 
 /**
  * Bearer-token auth only: the Spaak broker (or another Bearer-authenticated gateway with If-Match,
- * If-None-Match and ETag) speaks `etag`; the GCS XML API speaks `gcs`. Never retries.
+ * If-None-Match and ETag) speaks `etag`; the GCS XML API speaks `gcs`. Never retries. With a
+ * generation, every request carries `x-t3-generation`, and a 403 or 409 carrying `x-t3-fenced: 1`
+ * is CentralObjectFencedError.
  */
 export const layerHttp = (options: {
   readonly baseUrl: URL;
   readonly tokenFile: string | undefined;
   readonly preconditions: "etag" | "gcs";
+  readonly generation: number | undefined;
 }): Layer.Layer<CentralObjectStore, never, HttpClient.HttpClient | FileSystem.FileSystem> =>
   Layer.effect(CentralObjectStore, makeHttp(options));
 

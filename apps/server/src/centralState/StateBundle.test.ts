@@ -14,6 +14,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
@@ -27,6 +28,7 @@ import * as CentralObjectStore from "./CentralObjectStore.ts";
 import * as ClaudeTranscripts from "./ClaudeTranscripts.ts";
 import { RESTORE_SEQUENCE_JUMP } from "./DatabaseSnapshot.ts";
 import * as Manifest from "./Manifest.ts";
+import * as SnapshotLoop from "./SnapshotLoop.ts";
 import * as StateBundle from "./StateBundle.ts";
 
 const homeKey = "dev";
@@ -754,6 +756,45 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
       yield* assertRefsPresent(fixture, head.manifest);
       assert.isTrue(yield* fixture.objectExists(firstCopy));
     }),
+  );
+
+  it.effect("stops the snapshot loop, with no retry, once the broker fences this generation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* setup;
+        yield* seedHome(fixture);
+        const adopted = yield* prepare(fixture, "holder-a");
+        fixture.write("settings.json", '{"theme":"light"}');
+        let writes = 0;
+        const fenced = CentralObjectStore.CentralObjectStore.of({
+          ...fixture.store,
+          write: (key) =>
+            Effect.suspend(() => {
+              writes += 1;
+              return Effect.fail(
+                new CentralObjectStore.CentralObjectFencedError({ key, status: 409 }),
+              );
+            }),
+        });
+
+        // The idle sweep is due at once, so the loop's first poll pushes.
+        const loop = yield* SnapshotLoop.start({
+          ctx: fixture.context("holder-a"),
+          committed: yield* Ref.make(adopted.committed),
+          cache: adopted.cache,
+          claude: noClaude,
+          policy: { debounceMs: 0, minSpacingMs: 2_000, maxIntervalMs: 0, idleIntervalMs: 0 },
+          finalPushTimeout: Duration.seconds(20),
+          head: yield* Ref.make<number | null>(null),
+          isFenced: Effect.succeed(false),
+          lease: { remainingMs: Effect.succeed(60_000) },
+        }).pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, fenced));
+        yield* Deferred.await(loop.fenced);
+        yield* loop.stop;
+        assert.isFalse(yield* loop.finalPush);
+        assert.strictEqual(writes, 2);
+      }),
+    ),
   );
 
   it.effect("reserves a new floor above every earlier restore", () =>

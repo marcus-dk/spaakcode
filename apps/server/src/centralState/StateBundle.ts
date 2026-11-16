@@ -72,11 +72,15 @@ export interface ClaudeHooks {
       readonly length: number;
     }) => Effect.Effect<
       typeof BlobRef.Type,
-      CentralObjectStore.CentralObjectStoreError | PlatformError.PlatformError
+      | CentralObjectStore.CentralObjectStoreError
+      | CentralObjectStore.CentralObjectFencedError
+      | PlatformError.PlatformError
     >;
   }) => Effect.Effect<
     typeof ClaudeSection.Type,
-    CentralObjectStore.CentralObjectStoreError | PlatformError.PlatformError
+    | CentralObjectStore.CentralObjectStoreError
+    | CentralObjectStore.CentralObjectFencedError
+    | PlatformError.PlatformError
   >;
   readonly stage: (input: {
     readonly claudeHome: string;
@@ -91,6 +95,7 @@ export interface ClaudeHooks {
       | Blobs.CentralBlobMissingError
       | Blobs.CentralBlobIntegrityError
       | CentralObjectStore.CentralObjectStoreError
+      | CentralObjectStore.CentralObjectFencedError
       | PlatformError.PlatformError
     >;
   }) => Effect.Effect<
@@ -98,6 +103,7 @@ export interface ClaudeHooks {
     | Blobs.CentralBlobMissingError
     | Blobs.CentralBlobIntegrityError
     | CentralObjectStore.CentralObjectStoreError
+    | CentralObjectStore.CentralObjectFencedError
     | PlatformError.PlatformError
   >;
 }
@@ -195,6 +201,7 @@ export type PrepareError =
   | Blobs.CentralBlobIntegrityError
   | DatabaseSnapshot.CentralStateSnapshotError
   | CentralObjectStore.CentralObjectStoreError
+  | CentralObjectStore.CentralObjectFencedError
   | CentralCasLostError
   | CentralStateFencedError
   | PlatformError.PlatformError;

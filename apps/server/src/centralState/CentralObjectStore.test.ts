@@ -47,6 +47,7 @@ const makeHttpStore = (input: {
   readonly preconditions?: "etag" | "gcs";
   readonly tokenFile?: string;
   readonly baseUrl?: string;
+  readonly generation?: number;
 }) =>
   Effect.gen(function* () {
     const requests: Array<RecordedRequest> = [];
@@ -60,6 +61,7 @@ const makeHttpStore = (input: {
         baseUrl: new URL(input.baseUrl ?? "https://store.test/v1/t3/objects/"),
         tokenFile: input.tokenFile,
         preconditions: input.preconditions ?? "etag",
+        generation: input.generation,
       }).pipe(Layer.provide(Layer.succeed(HttpClient.HttpClient, client))),
     );
     return { store, requests };
@@ -247,6 +249,28 @@ it.layer(NodeServices.layer)("CentralObjectStore HTTP backend", (it) => {
     }),
   );
 
+  it.effect.each([409, 403])("status %d with x-t3-fenced is a fence on every operation", (status) =>
+    Effect.gen(function* () {
+      const { store, requests } = yield* makeHttpStore({
+        generation: 7,
+        respond: () => new Response("stale", { status, headers: { "x-t3-fenced": "1" } }),
+      });
+      const errors = [
+        yield* failureOf(store.read("k")),
+        yield* failureOf(store.download("k", "/nonexistent/never-written")),
+        yield* failureOf(store.write("k", bytes("x"), IfVersion('"1"'))),
+        yield* failureOf(store.remove("k")),
+      ];
+      for (const error of errors) {
+        assert.deepInclude(error, { _tag: "CentralObjectFencedError", key: "k", status });
+      }
+      assert.deepStrictEqual(
+        requests.map(({ headers }) => headers["x-t3-generation"]),
+        ["7", "7", "7", "7"],
+      );
+    }),
+  );
+
   it.effect("GET 404 is absent and DELETE 404 succeeds", () =>
     Effect.gen(function* () {
       const { store } = yield* makeHttpStore({
@@ -297,13 +321,14 @@ it.layer(NodeServices.layer)("CentralObjectStore HTTP backend", (it) => {
     }),
   );
 
-  it.effect("sends no Authorization header without a token file", () =>
+  it.effect("sends no Authorization or generation header without a token file or generation", () =>
     Effect.gen(function* () {
       const { store, requests } = yield* makeHttpStore({
         respond: () => new Response(null, { status: 204 }),
       });
       yield* store.remove("k");
       assert.isUndefined(requests[0]?.headers.authorization);
+      assert.isUndefined(requests[0]?.headers["x-t3-generation"]);
     }),
   );
 
@@ -338,6 +363,7 @@ it.layer(NodeServices.layer)("CentralObjectStore HTTP backend", (it) => {
           baseUrl: new URL("https://store.test/objects?userProject=secret-query"),
           tokenFile: undefined,
           preconditions: "etag",
+          generation: undefined,
         }).pipe(Layer.provide(Layer.succeed(HttpClient.HttpClient, client))),
       );
       const error = yield* failureOf(store.write("k", bytes("x"), IfAbsent));
@@ -388,6 +414,7 @@ it.live("the undici HTTP backend sends a file body with its Content-Length, not 
         baseUrl: new URL(`http://127.0.0.1:${address.port}/v1/t3/objects`),
         tokenFile: undefined,
         preconditions: "etag",
+        generation: undefined,
       }),
     );
     yield* store.write("homes/a/blobs/x", { _tag: "File", path: file }, IfAbsent);

@@ -265,7 +265,6 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
   cliLogLevel: Option.Option<LogLevel.LogLevel>,
   options?: {
     readonly startupPresentation?: ServerConfig.StartupPresentation;
-    readonly forceAutoBootstrapProjectFromCwd?: boolean;
     readonly rejectRunningServer?: boolean;
     readonly selectAutomaticPort?: (
       preferred: number,
@@ -389,10 +388,9 @@ export const resolveServerConfig = Effect.fn("config.resolveServerConfig")(funct
   const resourceMonitorPath = bootstrap?.resourceMonitorPath;
   const autoBootstrapProjectFromCwd = Option.getOrElse(
     resolveOptionPrecedence(
-      Option.fromUndefinedOr(options?.forceAutoBootstrapProjectFromCwd),
-      isHeadlessStartup ? Option.some(false) : Option.none(),
       normalizedFlags.autoBootstrapProjectFromCwd,
       Option.fromUndefinedOr(env.autoBootstrapProjectFromCwd),
+      isHeadlessStartup ? Option.some(false) : Option.none(),
     ),
     () => mode === "web",
   );

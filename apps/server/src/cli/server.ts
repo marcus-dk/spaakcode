@@ -21,7 +21,6 @@ const runServerCommand = Effect.fn("server.runServerCommand")(function* (
   flags: CliServerFlags,
   options?: {
     readonly startupPresentation?: ServerConfig.StartupPresentation;
-    readonly forceAutoBootstrapProjectFromCwd?: boolean;
     readonly rejectRunningServer?: boolean;
   },
 ) {
@@ -80,7 +79,7 @@ export const startCommand = Command.make("start", { ...sharedServerCommandFlags 
   Command.withHandler((flags) => runServerCommand(flags, { rejectRunningServer: true })),
 );
 
-// Serve never bootstraps a project, so it does not offer the flag that asks for one.
+// Serve bootstraps a project only when T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD asks; it has no flag.
 const { autoBootstrapProjectFromCwd: _, ...serveCommandFlags } = sharedServerCommandFlags;
 
 export const serveCommand = Command.make("serve", serveCommandFlags).pipe(
@@ -91,10 +90,7 @@ export const serveCommand = Command.make("serve", serveCommandFlags).pipe(
   Command.withHandler((flags) =>
     runServerCommand(
       { ...flags, autoBootstrapProjectFromCwd: Option.none() },
-      {
-        startupPresentation: "headless",
-        forceAutoBootstrapProjectFromCwd: false,
-      },
+      { startupPresentation: "headless" },
     ),
   ),
 );

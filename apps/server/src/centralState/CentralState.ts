@@ -60,10 +60,10 @@ export type CentralStateError =
   | ServerOwnership.ServerAlreadyRunningError
   | ServerOwnership.ServerOwnershipError;
 
-const storeLayer = (store: CentralStateSettings["store"]) =>
+const storeLayer = ({ store, generation }: CentralStateSettings) =>
   store._tag === "Filesystem"
     ? CentralObjectStore.layerFilesystem(store.root)
-    : CentralObjectStore.layerHttpUndici(store);
+    : CentralObjectStore.layerHttpUndici({ ...store, generation });
 
 const readBootId = Effect.gen(function* () {
   if ((yield* HostProcess.Platform) !== "linux") return null;
@@ -108,6 +108,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
       pid: process.pid,
       bootId: yield* readBootId,
       stateDir: config.stateDir,
+      ...(settings.generation === undefined ? {} : { generation: settings.generation }),
     },
     buildVersion: packageJson.version,
     paths: {
@@ -123,8 +124,12 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
     Effect.annotateLogs({
       homeKey: settings.homeKey,
       store: settings.store._tag === "Filesystem" ? "filesystem" : settings.store.baseUrl.host,
+      generation: settings.generation ?? null,
     }),
   );
+
+  const fencedError = (reason: CentralLease.LeaseLoss) =>
+    new CentralLease.CentralStateFencedError({ homeKey: settings.homeKey, reason });
 
   return yield* Effect.gen(function* () {
     const outerScope = yield* Scope.Scope;
@@ -145,10 +150,16 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
         }).pipe(Scope.provide(outerScope));
         const prepared = yield* StateBundle.prepareHome({ ctx, lease, claude }).pipe(
           Effect.onError(() => lease.release),
+          Effect.catchTags({
+            CentralObjectFencedError: () => Effect.fail(fencedError("superseded")),
+          }),
         );
         return { lease, prepared };
       }),
     );
+    if (settings.publicUrl !== undefined) {
+      yield* Effect.logInfo(`Serving T3 home ${settings.homeKey} at ${settings.publicUrl}.`);
+    }
 
     const loop = yield* SnapshotLoop.start({
       ctx,
@@ -157,6 +168,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
       claude,
       policy: {
         debounceMs: Duration.toMillis(settings.debounce),
+        minSpacingMs: Duration.toMillis(settings.minSpacing),
         maxIntervalMs: Duration.toMillis(settings.maxInterval),
         idleIntervalMs: Duration.toMillis(settings.idleInterval),
       },
@@ -170,8 +182,6 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
       Effect.all([Deferred.isDone(lease.lost), Deferred.isDone(loop.fenced)]),
       ([lost, fenced]) => lost || fenced,
     );
-    const fencedError = (reason: CentralLease.LeaseLoss) =>
-      new CentralLease.CentralStateFencedError({ homeKey: settings.homeKey, reason });
     const handoff = yield* Ref.make<{ readonly host: string; readonly pid: number } | null>(null);
     const awaitStop = Effect.raceFirst(
       Effect.flatMap(Deferred.await(lease.lost), (reason) => Effect.fail(fencedError(reason))),
@@ -220,7 +230,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
         return yield* exit;
       }),
     );
-  }).pipe(Effect.scoped, Effect.provide(storeLayer(settings.store)));
+  }).pipe(Effect.scoped, Effect.provide(storeLayer(settings)));
 });
 
 /**

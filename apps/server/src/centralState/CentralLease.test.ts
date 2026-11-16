@@ -63,6 +63,21 @@ const flaky = (store: CentralObjectStore.CentralObjectStore["Service"], down: ()
   });
 };
 
+/** The same store, refusing every request as the broker does once a newer pod exists. */
+const fencedWhile = (
+  store: CentralObjectStore.CentralObjectStore["Service"],
+  fenced: () => boolean,
+) => {
+  const refused = (key: string) =>
+    new CentralObjectStore.CentralObjectFencedError({ key, status: 409 });
+  return CentralObjectStore.CentralObjectStore.of({
+    ...store,
+    read: (key) => (fenced() ? Effect.fail(refused(key)) : store.read(key)),
+    write: (key, body, precondition) =>
+      fenced() ? Effect.fail(refused(key)) : store.write(key, body, precondition),
+  });
+};
+
 const holder = (id: string, overrides: Partial<typeof Manifest.Holder.Type> = {}) => ({
   holderId: id,
   host: `host-${id}`,
@@ -153,13 +168,19 @@ describe("CentralLease", () => {
           previous: holder("a", { host: "host-b", pid: 2147483646, stateDir: "/homes/b/userdata" }),
           waitMs: 0,
         },
+        // An older generation of the session is already fenced by the broker.
+        { previous: holder("a", { generation: 4 }), generation: 5, waitMs: 0 },
+        { previous: holder("a", { generation: 5 }), generation: 5, waitMs: ttlMs * 1.5 },
+        { previous: holder("a"), generation: 5, waitMs: ttlMs * 1.5 },
+        { previous: holder("a", { generation: 4 }), waitMs: ttlMs * 1.5 },
       ],
-      ({ previous, waitMs }) =>
+      ({ previous, generation, waitMs }) =>
         Effect.scoped(
           Effect.gen(function* () {
             const store = makeStore();
             yield* seed(store, previous);
-            const taker = yield* Effect.forkChild(acquire(store, holder("b")));
+            const me = holder("b", generation === undefined ? {} : { generation });
+            const taker = yield* Effect.forkChild(acquire(store, me));
             if (waitMs > 0) {
               yield* TestClock.adjust(Duration.millis(waitMs - 1));
               assert.strictEqual(yield* holderIdOf(store), "a");
@@ -168,9 +189,51 @@ describe("CentralLease", () => {
             const lease = yield* Fiber.join(taker);
             assert.strictEqual(Option.getOrThrow(lease.previous).headSequence, 41);
             assert.strictEqual(yield* holderIdOf(store), "b");
+            assert.strictEqual((yield* readLease(store)).value.holder?.generation, generation);
           }),
         ),
       { discard: true },
+    ),
+  );
+
+  it.effect("stops at once as superseded when a newer generation holds the home", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const store = makeStore();
+        yield* seed(store, holder("a", { generation: 6 }));
+        const leaseBefore = yield* readLease(store);
+        const stale = yield* Effect.flip(acquire(store, holder("b", { generation: 5 })));
+        assert.deepInclude(stale, { _tag: "CentralStateFencedError", reason: "superseded" });
+        assert.strictEqual((yield* readLease(store)).version, leaseBefore.version);
+
+        // The broker refusing this generation says the same.
+        const refused = yield* Effect.flip(
+          acquire(
+            fencedWhile(store, () => true),
+            holder("c", { generation: 5 }),
+          ),
+        );
+        assert.deepInclude(refused, { _tag: "CentralStateFencedError", reason: "superseded" });
+      }),
+    ),
+  );
+
+  it.effect("takes over from an older generation that stole the lease while it waited", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const store = makeStore();
+        yield* seed(store, holder("a"));
+        const older = yield* Effect.forkChild(acquire(store, holder("b", { generation: 5 })));
+        yield* TestClock.adjust(Duration.millis(ttlMs / 20));
+        const newer = yield* Effect.forkChild(acquire(store, holder("c", { generation: 6 })));
+        yield* TestClock.adjust(Duration.millis(ttlMs * 1.5 - ttlMs / 20));
+        const b = yield* Fiber.join(older);
+        yield* TestClock.adjust(Duration.millis(ttlMs / 20));
+        yield* Fiber.join(newer);
+        assert.strictEqual(yield* holderIdOf(store), "c");
+        yield* TestClock.adjust(Duration.millis(ttlMs / 4));
+        assert.strictEqual(yield* Deferred.await(b.lost), "superseded");
+      }),
     ),
   );
 
@@ -272,6 +335,21 @@ describe("CentralLease", () => {
         assert.strictEqual(yield* Deferred.await(a.lost), "superseded");
         yield* a.release;
         assert.strictEqual(yield* holderIdOf(store), "x");
+      }),
+    ),
+  );
+
+  it.effect("marks the holder superseded at once when the broker refuses its generation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let fenced = false;
+        const a = yield* acquire(
+          fencedWhile(makeStore(), () => fenced),
+          holder("a", { generation: 5 }),
+        );
+        fenced = true;
+        yield* TestClock.adjust(Duration.millis(ttlMs / 4));
+        assert.strictEqual(yield* Deferred.await(a.lost), "superseded");
       }),
     ),
   );

@@ -92,6 +92,19 @@ const isDeadSibling = (holder: Holder, me: Holder) =>
   holder.stateDir === me.stateDir &&
   !isProcessAlive(holder.pid);
 
+/**
+ * The session service hands each new pod of a home a higher generation and its broker refuses the
+ * older ones, so an older holder is already fenced and a newer one makes this server the stale pod.
+ */
+const generationOrder = (holder: Holder, me: Holder) =>
+  holder.generation === undefined ||
+  me.generation === undefined ||
+  holder.generation === me.generation
+    ? "unordered"
+    : holder.generation < me.generation
+      ? "older"
+      : "newer";
+
 export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
   readonly homeKey: string;
   readonly holder: Holder;
@@ -118,6 +131,9 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
       }),
     ),
   );
+
+  const supersededError = () =>
+    new CentralStateFencedError({ homeKey: input.homeKey, reason: "superseded" });
 
   const heldError = (holder: Holder) =>
     new CentralStateLeaseHeldError({
@@ -178,7 +194,7 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
     return { previous, record, version, startedAt };
   });
 
-  /** One pass of the acquire loop; none means the lease was released while we watched. */
+  /** One pass of the acquire loop; none means look again (the lease was released or re-held). */
   const attempt = Effect.fnUntraced(function* () {
     const current = yield* readLease;
     if (Option.isNone(current))
@@ -186,9 +202,15 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
     let record = current.value.value;
     let version = current.value.version;
     let holder = record.holder;
-    if (holder === null || holder.holderId === me.holderId || isDeadSibling(holder, me)) {
+    if (
+      holder === null ||
+      holder.holderId === me.holderId ||
+      isDeadSibling(holder, me) ||
+      generationOrder(holder, me) === "older"
+    ) {
       return Option.some(yield* claim(Option.some(record), { _tag: "IfVersion", version }));
     }
+    if (generationOrder(holder, me) === "newer") return yield* supersededError();
 
     if (input.takeover) {
       requestedAt ??= yield* monotonicMillis;
@@ -233,6 +255,7 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
       const polledHolder = Option.isSome(polled) ? polled.value.value.holder : null;
       if (Option.isNone(polled) || polledHolder === null) return Option.none();
       if (polled.value.version !== version) {
+        if (generationOrder(polledHolder, me) !== "unordered") return Option.none();
         if (!input.takeover) return yield* heldError(polledHolder);
         record = polled.value.value;
         holder = polledHolder;
@@ -251,6 +274,7 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
       }
       const error = outcome.failure;
       if (error._tag === "CentralCasLostError") continue;
+      if (error._tag === "CentralObjectFencedError") return yield* supersededError();
       if (error._tag !== "CentralObjectStoreError") return yield* error;
       const now = yield* monotonicMillis;
       unreachableSince ??= now;
@@ -322,6 +346,8 @@ export const acquire = Effect.fn("CentralLease.acquire")(function* (input: {
         record = value;
         version = written.success.version;
         lastOk = roundAt;
+      } else if (written.failure._tag === "CentralObjectFencedError") {
+        return yield* Deferred.succeed(lost, "superseded");
       } else if (written.failure._tag === "CentralCasLostError") {
         const remote = yield* Effect.result(Manifest.readJson(key, Manifest.LeaseRecord));
         // A failed re-read is like a failed renewal: try again next round.

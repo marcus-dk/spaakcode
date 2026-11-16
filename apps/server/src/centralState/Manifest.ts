@@ -60,6 +60,8 @@ export const Holder = Schema.Struct({
   pid: Schema.Number,
   bootId: Schema.NullOr(Schema.String),
   stateDir: Schema.String,
+  /** The session service's pod generation, when it assigns one. */
+  generation: Schema.optionalKey(Schema.Number),
 });
 export const HistoryRef = Schema.Struct({ epoch: Schema.String, generation: Schema.Number });
 export const PinnedRef = Schema.Struct({
@@ -234,6 +236,7 @@ export const casWrite = Effect.fn("Manifest.casWrite")(function* <
     );
     if (Result.isSuccess(written)) return written.success;
     const writeError = written.failure;
+    if (writeError._tag === "CentralObjectFencedError") return yield* writeError;
 
     let lastError: CentralObjectStore.CentralObjectStoreError;
     const remote = yield* readJson(input.key, input.schema).pipe(

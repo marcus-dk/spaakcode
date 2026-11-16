@@ -1,11 +1,11 @@
 export interface PolicyConfig {
   readonly debounceMs: number;
+  /** Floor on push spacing; with 20 × the last push's duration it keeps snapshots near 5% of a core. */
+  readonly minSpacingMs: number;
   readonly maxIntervalMs: number;
   readonly idleIntervalMs: number;
 }
 
-/** Floor on push spacing; with 20 × the last push's duration it keeps snapshots near 5% of a core. */
-export const MIN_SPACING_MS = 30_000;
 const SPACING_PER_PUSH_DURATION = 20;
 
 export interface PolicyState {
@@ -45,7 +45,7 @@ export const decide = (s: PolicyState, nowMs: number, cfg: PolicyConfig): "push"
   if (
     s.lastPushStartedAt !== null &&
     nowMs - s.lastPushStartedAt <
-      Math.max(MIN_SPACING_MS, SPACING_PER_PUSH_DURATION * s.lastPushDurationMs)
+      Math.max(cfg.minSpacingMs, SPACING_PER_PUSH_DURATION * s.lastPushDurationMs)
   ) {
     return "wait";
   }
