@@ -8,7 +8,7 @@ import * as Schema from "effect/Schema";
 
 import * as CentralObjectStore from "./CentralObjectStore.ts";
 import {
-  type CentralCasLostError,
+  CentralCasLostError,
   type Manifest,
   type TailEntry,
   TRANSCRIPT_MAX_CHUNKS,
@@ -54,7 +54,8 @@ export const read = Effect.fn("TranscriptTail.read")(function* (homeKey: string)
 });
 
 export const extendsHead = (tail: Tail, head: Manifest): boolean =>
-  tail.epoch === head.epoch && tail.generation === head.generation;
+  tail.generation === head.generation &&
+  (tail.epoch === head.epoch || (head.fencedFrom ?? []).includes(tail.epoch));
 
 export const make = (input: {
   readonly homeKey: string;
@@ -106,7 +107,12 @@ export const write = Effect.fn("TranscriptTail.write")(function* (
     return yield* attempt(yield* read(homeKey));
   });
   return yield* attempt(previous).pipe(
-    Effect.catchTags({ CentralCasLostError: overwriteAsHolder }),
+    Effect.catchTags({
+      CentralCasLostError: overwriteAsHolder,
+      // A failed write reads the key back, and an index that does not decode fails that read.
+      CentralStateCorruptObjectError: () =>
+        overwriteAsHolder(new CentralCasLostError({ key: keys.tail(homeKey) })),
+    }),
   );
 });
 
@@ -123,11 +129,15 @@ export const chunksOf = (tail: Tail | null | undefined): ReadonlySet<string> =>
 
 export const isEmpty = (tail: Tail | null): boolean => tail !== null && chunksOf(tail).size === 0;
 
-/** `files` with each tail entry's lines appended; an entry that follows other content is dropped. */
+/**
+ * `files` with each tail entry's lines appended; an entry that follows other content is dropped.
+ * Only roots `files` names (toFiles names every layout root) are read: an index root is a path.
+ */
 export const appendTo = (files: TranscriptFiles, tail: TailFiles): TranscriptFiles => {
   const merged = { ...files };
-  for (const [root, entries] of Object.entries(tail)) {
-    const committed = files[root] ?? {};
+  for (const [root, committed] of Object.entries(files)) {
+    const entries = tail[root];
+    if (entries === undefined) continue;
     const byPath = { ...committed };
     for (const [relativePath, { baseSize, ...entry }] of Object.entries(entries)) {
       const base = committed[relativePath];

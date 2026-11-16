@@ -104,6 +104,7 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
         source,
         transcripts: input.transcripts,
         lease: input.lease,
+        final: source._tag === "Closed",
       });
       if (outcome._tag === "Committed" || outcome._tag === "Adopted") {
         yield* Ref.set(input.committed, outcome.committed);

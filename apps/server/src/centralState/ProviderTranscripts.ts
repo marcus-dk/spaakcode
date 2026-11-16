@@ -66,6 +66,8 @@ const completeLinesEnd = Effect.fnUntraced(function* (
  */
 export interface Layout<Section> {
   readonly roots: ReadonlyArray<string>;
+  /** The roots whose files only grow; the transcript fast lane ships these, a push all roots. */
+  readonly appendRoots: ReadonlyArray<string>;
   readonly toFiles: (section: Section) => TranscriptFiles;
   readonly fromFiles: (files: TranscriptFiles) => Section;
 }
@@ -75,6 +77,7 @@ const hasFiles = (files: Readonly<Record<string, Entry>>) => Object.keys(files).
 export const claude: Layout<typeof ClaudeSection.Type> = {
   // Claude's TaskGet and TaskUpdate read <claudeHome>/tasks/<session id> back on resume.
   roots: ["projects", "tasks"],
+  appendRoots: ["projects", "tasks"],
   toFiles: (section) => ({ projects: section.files, tasks: section.tasks ?? {} }),
   fromFiles: ({ projects = {}, tasks = {} }) =>
     hasFiles(tasks) ? { files: projects, tasks } : { files: projects },
@@ -83,6 +86,8 @@ export const claude: Layout<typeof ClaudeSection.Type> = {
 export const codex: Layout<typeof CodexSection.Type | undefined> = {
   // thread/resume looks a rollout up by thread id under sessions/, or archived_sessions/ once archived.
   roots: ["sessions", "archived_sessions"],
+  // Archiving moves a rollout, which a tail cannot record: it would restore both copies.
+  appendRoots: ["sessions"],
   toFiles: (section) => ({
     sessions: section?.sessions ?? {},
     archived_sessions: section?.archivedSessions ?? {},

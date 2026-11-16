@@ -261,6 +261,7 @@ const pushClosed = (
     readonly dataVersion?: number;
     readonly remainingMs?: number;
     readonly transcripts?: StateBundle.TranscriptHooks;
+    readonly final?: boolean;
   } = {},
 ) =>
   fixture.run(
@@ -271,7 +272,48 @@ const pushClosed = (
       source: { _tag: "Closed", dataVersion: options.dataVersion ?? null },
       transcripts: options.transcripts ?? noTranscripts,
       lease: { remainingMs: Effect.succeed(options.remainingMs ?? 60_000) },
+      ...(options.final === undefined ? {} : { final: options.final }),
     }),
+  );
+
+/** The fixture's store, whose first `operation` on `key` fails as an unavailable store. */
+const failingOnce = (fixture: Fixture, operation: "read" | "write", key: string) =>
+  Effect.gen(function* () {
+    const failed = yield* Deferred.make<void>();
+    let failures = 1;
+    const fail = Effect.suspend(() => {
+      failures -= 1;
+      return Effect.andThen(
+        Deferred.succeed(failed, undefined),
+        Effect.fail(
+          new CentralObjectStore.CentralObjectStoreError({
+            operation,
+            key,
+            status: 503,
+            cause: new Error("unavailable"),
+          }),
+        ),
+      );
+    });
+    const store = CentralObjectStore.CentralObjectStore.of({
+      ...fixture.store,
+      read: (read) =>
+        operation === "read" && read === key && failures > 0 ? fail : fixture.store.read(read),
+      write: (written, body, precondition) =>
+        operation === "write" && written === key && failures > 0
+          ? fail
+          : fixture.store.write(written, body, precondition),
+    });
+    return { store, failed };
+  });
+
+const writeTail = (fixture: Fixture, value: unknown) =>
+  fixture.run(
+    fixture.store.write(
+      Manifest.keys.tail(homeKey),
+      { _tag: "Bytes", bytes: new TextEncoder().encode(JSON.stringify(value)) },
+      { _tag: "None" },
+    ),
   );
 
 const shipTail = (
@@ -629,10 +671,11 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
         const rollout = `${codexHome}/sessions/2026/11/16/rollout-a.jsonl`;
         yield* seedHome(fixture);
         appendAt(session, '{"n":1}\n');
+        appendAt(rollout, '{"type":"session_meta"}\n');
         const adopted = yield* prepare(fixture, "holder-a", transcripts);
 
         appendAt(session, '{"n":2}\n{"n":3');
-        appendAt(rollout, '{"type":"session_meta"}\n');
+        appendAt(rollout, '{"type":"turn_context"}\n');
         assert.isTrue(yield* shipTail(fixture, "holder-a", adopted, transcripts));
         const shipped = storedTail(adopted.cache);
         assert.strictEqual(shipped.generation, adopted.committed.manifest.generation);
@@ -650,7 +693,10 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
         const restored = yield* prepare(fixture, "holder-b", transcripts);
         assert.strictEqual(restored.mode, "restore");
         assert.strictEqual(NodeFS.readFileSync(session, "utf8"), '{"n":1}\n{"n":2}\n');
-        assert.strictEqual(NodeFS.readFileSync(rollout, "utf8"), '{"type":"session_meta"}\n');
+        assert.strictEqual(
+          NodeFS.readFileSync(rollout, "utf8"),
+          '{"type":"session_meta"}\n{"type":"turn_context"}\n',
+        );
         // The restorer carries the tail on its own head until its first push.
         const adoptedTail = storedTail(restored.cache);
         assert.strictEqual(adoptedTail.epoch, restored.committed.manifest.epoch);
@@ -745,6 +791,147 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
       assert.isTrue(yield* shipTail(fixture, "holder-b", holderB, transcripts));
       const current = Option.getOrThrow(yield* fixture.run(TranscriptTail.read(homeKey))).value;
       assert.strictEqual(current?.holderId, "holder-b");
+    }),
+  );
+
+  it.effect(
+    "ships appends only from roots that grow, and Codex ones once restore checks them",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* setup;
+        const transcripts = yield* ProviderTranscripts.hooks;
+        const { claudeHome, codexHome } = fixture.context("a").paths;
+        const session = `${claudeHome}/projects/-work/session-a.jsonl`;
+        const rollout = `${codexHome}/sessions/2026/11/16/rollout-a.jsonl`;
+        const archived = `${codexHome}/archived_sessions/rollout-a.jsonl`;
+        yield* seedHome(fixture);
+        appendAt(session, '{"n":1}\n');
+        const adopted = yield* prepare(fixture, "holder-a", transcripts);
+
+        // Restore checks the Codex home only once the head has Codex sessions.
+        appendAt(session, '{"n":2}\n');
+        appendAt(rollout, '{"type":"session_meta"}\n');
+        assert.isTrue(yield* shipTail(fixture, "holder-a", adopted, transcripts));
+        assert.deepStrictEqual(storedTail(adopted.cache).codex, {});
+
+        // Archiving moves the rollout; only a push can record that, or restore keeps both copies.
+        const committed = committedOf(
+          yield* pushClosed(fixture, "holder-a", adopted.committed, adopted.cache, { transcripts }),
+        );
+        NodeFS.mkdirSync(`${codexHome}/archived_sessions`, { recursive: true });
+        NodeFS.renameSync(rollout, archived);
+        appendAt(session, '{"n":3}\n');
+        const pushed = { committed, cache: adopted.cache };
+        assert.isTrue(yield* shipTail(fixture, "holder-a", pushed, transcripts));
+        assert.deepStrictEqual(storedTail(adopted.cache).codex, {});
+      }),
+  );
+
+  it.effect("never restores a tail entry outside the provider's transcript roots", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const transcripts = yield* ProviderTranscripts.hooks;
+      const { baseDir, claudeHome, codexHome } = fixture.context("a").paths;
+      const session = `${claudeHome}/projects/-work/session-a.jsonl`;
+      yield* seedHome(fixture);
+      appendAt(session, '{"n":1}\n');
+      const adopted = yield* prepare(fixture, "holder-a", transcripts);
+      appendAt(session, '{"n":2}\n');
+      yield* shipTail(fixture, "holder-a", adopted, transcripts);
+      const shipped = storedTail(adopted.cache);
+      const entry = { ...shipped.claude["projects"]!["-work/session-a.jsonl"]!, baseSize: 0 };
+      yield* writeTail(fixture, {
+        ...shipped,
+        claude: { ...shipped.claude, "..": { "escape.jsonl": entry } },
+        codex: { ".": { "auth.json": entry } },
+      });
+
+      fixture.wipe();
+      yield* prepare(fixture, "holder-b", transcripts);
+      assert.strictEqual(NodeFS.readFileSync(session, "utf8"), '{"n":1}\n{"n":2}\n');
+      assert.isFalse(NodeFS.existsSync(`${codexHome}/auth.json`));
+      assert.isFalse(NodeFS.existsSync(`${baseDir}/escape.jsonl`));
+    }),
+  );
+
+  it.effect("leaves the transcript tail to the next restore in the final push", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const transcripts = yield* ProviderTranscripts.hooks;
+      const session = `${fixture.context("a").paths.claudeHome}/projects/-work/session-a.jsonl`;
+      yield* seedHome(fixture);
+      appendAt(session, '{"n":1}\n');
+      const adopted = yield* prepare(fixture, "holder-a", transcripts);
+      appendAt(session, '{"n":2}\n');
+      yield* shipTail(fixture, "holder-a", adopted, transcripts);
+      const shipped = Option.getOrThrow(adopted.cache.tail);
+
+      // Its deletes would run inside the final push's timeout, after the commit.
+      fixture.write("settings.json", '{"theme":"light"}');
+      committedOf(
+        yield* pushClosed(fixture, "holder-a", adopted.committed, adopted.cache, {
+          transcripts,
+          final: true,
+        }),
+      );
+      const kept = Option.getOrThrow(yield* fixture.run(TranscriptTail.read(homeKey)));
+      assert.strictEqual(kept.version, shipped.version);
+
+      // The head holds the tail's lines, so the restore drops the tail instead of appending it.
+      fixture.wipe();
+      const restored = yield* prepare(fixture, "holder-b", transcripts);
+      assert.strictEqual(NodeFS.readFileSync(session, "utf8"), '{"n":1}\n{"n":2}\n');
+      assert.deepStrictEqual(storedTail(restored.cache).claude, {});
+      for (const sha256 of TranscriptTail.chunksOf(shipped.value)) {
+        assert.isFalse(yield* fixture.objectExists(Manifest.keys.tailChunk(homeKey, sha256)));
+      }
+    }),
+  );
+
+  it.effect("keeps the transcript tail when a restore fails after its fence", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const transcripts = yield* ProviderTranscripts.hooks;
+      const session = `${fixture.context("a").paths.claudeHome}/projects/-work/session-a.jsonl`;
+      yield* seedHome(fixture);
+      appendAt(session, '{"n":1}\n');
+      const adopted = yield* prepare(fixture, "holder-a", transcripts);
+      appendAt(session, '{"n":2}\n');
+      yield* shipTail(fixture, "holder-a", adopted, transcripts);
+
+      // The first tail read comes after the fence, so the retry restores the fenced head.
+      fixture.wipe();
+      const flaky = yield* failingOnce(fixture, "read", Manifest.keys.tail(homeKey));
+      const restoring = yield* Effect.forkChild(
+        StateBundle.prepareHome({
+          ctx: fixture.context("holder-b"),
+          lease: yield* makeLease(),
+          transcripts,
+        }).pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, flaky.store)),
+      );
+      yield* Deferred.await(flaky.failed);
+      yield* TestClock.adjust(Duration.seconds(1));
+      assert.strictEqual((yield* Fiber.join(restoring)).mode, "restore");
+      assert.strictEqual(NodeFS.readFileSync(session, "utf8"), '{"n":1}\n{"n":2}\n');
+    }),
+  );
+
+  it.effect("replaces a tail index that does not decode even when the first write fails", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      yield* seedHome(fixture);
+      yield* prepare(fixture, "holder-a");
+      yield* writeTail(fixture, { formatVersion: 2 });
+
+      fixture.wipe();
+      const flaky = yield* failingOnce(fixture, "write", Manifest.keys.tail(homeKey));
+      const restored = yield* StateBundle.prepareHome({
+        ctx: fixture.context("holder-b"),
+        lease: yield* makeLease(),
+        transcripts: noTranscripts,
+      }).pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, flaky.store));
+      assert.strictEqual(restored.mode, "restore");
+      assert.strictEqual(storedTail(restored.cache).holderId, "holder-b");
     }),
   );
 

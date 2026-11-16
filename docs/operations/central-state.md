@@ -58,15 +58,21 @@ The head stays the commit point for everything else.
 - It reads only the appended range of a file, and with nothing appended it writes nothing. When
   pushes stall, a file whose tail reaches 64 chunks is shipped again as one chunk from the head.
 - It never runs while a push runs. A push takes everything the tail held into the head, empties
-  the index and deletes the chunks.
+  the index and deletes the chunks. The final push at shutdown leaves them, so their deletes cannot
+  outlast `finalPushTimeout` after the commit; the next start drops that tail.
 - Restore appends the tail to the transcripts it restores only when the index extends the head being
-  restored. It then carries the tail onto its own head, so a crash before its first push keeps it. A
-  tail that extends anything else is logged, emptied and its chunks deleted. A tail chunk that is
+  restored, or a head a failed restore fenced from it (the manifest's `fencedFrom`, up to 8). It then
+  carries the tail onto its own head, so a crash before its first push keeps it. A tail an older
+  generation left is emptied and its chunks deleted; a tail that extends anything else is logged
+  first. Only the provider's transcript roots are read from the index. A tail chunk that is
   missing or fails its sha256 check restores the home without the tail, with a warning.
 - Only the head's holder writes the index. A superseded server's shipment fails and stops it like
   a lost push, and a server whose lease is lost ships nothing.
 - Only `.jsonl` lines ship. Task lists, Claude's tool-result files and rewritten transcripts wait
   for the next push, so a restored transcript can name a tool-result file that is missing.
+- Codex rollouts ship only from `sessions/`, and only once the head has Codex sessions, since restore
+  checks the Codex home only then. A home's first Codex lines, and a rollout Codex archives, wait
+  for the next push.
 
 An active session sends about one chunk upload and one index write per interval.
 

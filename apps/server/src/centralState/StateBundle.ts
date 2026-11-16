@@ -31,6 +31,7 @@ import {
   type TranscriptEntry,
   Manifest,
   RETAIN_GENERATIONS,
+  RETAIN_FENCED_FROM,
   RETAIN_PINNED,
   casWrite,
   keys,
@@ -398,12 +399,14 @@ const providerHomes = (ctx: BundleContext, manifest: Manifest) => [
     provider: "claude" as const,
     home: ctx.paths.claudeHome,
     roots: ProviderTranscripts.claude.roots,
+    appendRoots: ProviderTranscripts.claude.appendRoots,
     files: ProviderTranscripts.claude.toFiles(manifest.claude),
   },
   {
     provider: "codex" as const,
     home: ctx.paths.codexHome,
     roots: ProviderTranscripts.codex.roots,
+    appendRoots: ProviderTranscripts.codex.appendRoots,
     files: ProviderTranscripts.codex.toFiles(manifest.codex),
   },
 ];
@@ -463,7 +466,9 @@ const adoptTail = Effect.fn("StateBundle.adoptTail")(function* (
   if (Option.isNone(stored)) return Option.none<TailWrite>();
   const current = stored.value.value;
   const applies = current !== null && TranscriptTail.extendsHead(current, restored);
-  if (!applies && current !== null && !TranscriptTail.isEmpty(current)) {
+  // An older generation's lines are in the head: the final push leaves its tail for this.
+  const folded = current !== null && current.generation < restored.generation;
+  if (!applies && !folded && current !== null && !TranscriptTail.isEmpty(current)) {
     yield* Effect.logWarning(
       "Ignored a central state transcript tail that extends another save.",
     ).pipe(
@@ -510,6 +515,8 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
     {
       ...previous,
       epoch: NodeCrypto.randomUUID(),
+      // A restore that fails before it adopts the tail leaves it stamped with this epoch.
+      fencedFrom: [previous.epoch, ...(previous.fencedFrom ?? [])].slice(0, RETAIN_FENCED_FROM),
       holder: ctx.holder,
       sequenceFloor: floor,
       writeNonce: NodeCrypto.randomUUID(),
@@ -934,6 +941,11 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
   readonly source: DbSource;
   readonly transcripts: TranscriptHooks;
   readonly lease: Pick<HeldLease, "remainingMs">;
+  /**
+   * The shutdown push: it leaves the tail, which the next restore drops, so the deletes do not
+   * outlast its timeout after the commit and report the save as failed.
+   */
+  readonly final?: boolean;
 }) {
   const { ctx, cache } = input;
   const previous = input.committed.manifest;
@@ -1038,7 +1050,7 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
             ...previous.pinned,
           ].slice(0, RETAIN_PINNED)
         : previous.pinned;
-    const { codex: _previousCodex, ...base } = previous;
+    const { codex: _previousCodex, fencedFrom: _fencedFrom, ...base } = previous;
     const draft: Manifest = {
       ...base,
       generation,
@@ -1084,7 +1096,7 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
     for (const sha256 of refsOf(next)) cache.knownBlobs.add(sha256);
     cache.historyManifests.set(historyKey, next);
 
-    yield* foldTail(ctx, next, cache, input.lease).pipe(
+    yield* (input.final === true ? Effect.void : foldTail(ctx, next, cache, input.lease)).pipe(
       Effect.catch((error) =>
         Effect.logWarning(
           "Could not reset the central state transcript tail; the next shipment replaces it.",
@@ -1146,9 +1158,11 @@ export const shipTail = Effect.fn("StateBundle.shipTail")(function* (input: {
   const files = { claude: tail.claude, codex: tail.codex };
   let appended = false;
   for (const home of providerHomes(ctx, head)) {
+    // Restore checks the Codex home only for a head with Codex sessions; the first ones wait for a push.
+    if (home.provider === "codex" && head.codex === undefined) continue;
     const added = yield* input.transcripts.collectAppends({
       home: home.home,
-      roots: home.roots,
+      roots: home.appendRoots,
       shipped: TranscriptTail.shippedFiles(home.files, tail[home.provider]),
       upload,
     });

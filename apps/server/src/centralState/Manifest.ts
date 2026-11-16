@@ -17,6 +17,8 @@ import * as CentralObjectStore from "./CentralObjectStore.ts";
 export const MANIFEST_READER_VERSION = 2;
 export const RETAIN_GENERATIONS = 10;
 export const RETAIN_PINNED = 2;
+/** Restores that failed after their fence each add one; a tail older than these is dropped. */
+export const RETAIN_FENCED_FROM = 8;
 export const TRANSCRIPT_MAX_CHUNKS = 64;
 
 export const keys = {
@@ -87,6 +89,11 @@ export const Manifest = Schema.Struct({
   epoch: Schema.String,
   /** +1 per committed push; fence writes keep it. */
   generation: Schema.Number,
+  /**
+   * Epochs the restores of this generation fenced, newest first. A fence keeps the content, so a
+   * transcript tail stamped with one still extends this head. A push drops it.
+   */
+  fencedFrom: Schema.optionalKey(Schema.Array(Schema.String)),
   holder: Holder,
   /** holderId whose database produced `database`; changed only by commits. */
   committedBy: Schema.NullOr(Schema.String),
