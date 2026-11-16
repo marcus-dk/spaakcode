@@ -18,6 +18,8 @@ A home is stored as a **state bundle** under `homes/<homeKey>/` in the store:
 - `manifests/<epoch>/<generation>.json`: history copies of the last 10 generations, plus the last
   generation from before each of the 2 most recent migrations.
 - `lease.json`: the record of which process serves the home.
+- `transcript-tail.json` and `tail/<sha256>`: transcript lines shipped since the head. See
+  [Transcript fast lane](#transcript-fast-lane).
 
 The bundle carries:
 
@@ -36,6 +38,29 @@ The bundle carries:
 
 Transcripts and rollouts are uploaded append-only: a push sends only the complete lines added since
 the last one.
+
+### Transcript fast lane
+
+Between pushes, every `T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL` (2 s), the server ships the complete
+lines appended to `.jsonl` transcripts and rollouts, without a database snapshot. Each shipment
+uploads one `tail/<sha256>` chunk per grown file and rewrites `transcript-tail.json`, a small
+compare-and-swap index naming the head it extends (epoch and generation) and the chunks past it.
+The head stays the commit point for everything else.
+
+- It reads only the appended range of a file, and with nothing appended it writes nothing. When
+  pushes stall, a file whose tail reaches 64 chunks is shipped again as one chunk from the head.
+- It never runs while a push runs. A push takes everything the tail held into the head, empties
+  the index and deletes the chunks.
+- Restore appends the tail to the transcripts it restores only when the index extends the head being
+  restored. It then carries the tail onto its own head, so a crash before its first push keeps it. A
+  tail that extends anything else is logged, emptied and its chunks deleted. A tail chunk that is
+  missing or fails its sha256 check restores the home without the tail, with a warning.
+- Only the head's holder writes the index. A superseded server's shipment fails and stops it like
+  a lost push, and a server whose lease is lost ships nothing.
+- Only `.jsonl` lines ship. Task lists, Claude's tool-result files and rewritten transcripts wait
+  for the next push, so a restored transcript can name a tool-result file that is missing.
+
+An active session sends about one chunk upload and one index write per interval.
 
 Symbolic links under the T3 home are never followed or synced, so a symlinked `settings.json`,
 theme or secret stays behind.
@@ -65,23 +90,24 @@ It does **not** carry:
 
 Central state is configured through environment variables only. There are no CLI flags.
 
-| Variable                                  | Default                     | Meaning                                                                                                                                                                 |
-| ----------------------------------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `T3CODE_CENTRAL_STATE_URL`                | unset, meaning **disabled** | `file:///abs/dir` selects the filesystem backend. `http(s)://…` selects the HTTP backend; object keys are appended to this base URL. Any other scheme is a config error |
-| `T3CODE_CENTRAL_STATE_HOME_KEY`           | required when URL is set    | Per-developer key; one live server per key. Must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`                                                                             |
-| `T3CODE_CENTRAL_STATE_TOKEN_FILE`         | unset                       | Bearer token file, re-read on every request (HTTP only)                                                                                                                 |
-| `T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS` | `etag`                      | `etag` (the Spaak broker, or another Bearer-token gateway) or `gcs` (GCS XML API, which uses `x-goog-generation`). S3, R2 and MinIO need SigV4 and are not supported    |
-| `T3CODE_CENTRAL_STATE_CLAUDE_HOME`        | `<baseDir>/claude`          | Absolute path. T3's Claude children use it as `CLAUDE_CONFIG_DIR`                                                                                                       |
-| `T3CODE_CENTRAL_STATE_CODEX_HOME`         | `<baseDir>/codex`           | Absolute path. T3's Codex children and terminals use it as `CODEX_HOME`                                                                                                 |
-| `T3CODE_CENTRAL_STATE_TAKEOVER`           | `false`                     | Ask a live holder to hand off instead of failing fast                                                                                                                   |
-| `T3CODE_CENTRAL_STATE_GENERATION`         | unset                       | Positive integer the session service gives each new pod of a home. See [Generations](#generations)                                                                      |
-| `T3CODE_CENTRAL_STATE_PUBLIC_URL`         | unset                       | The URL clients reach this server at. Only logged at startup, as `Serving T3 home <key> at <url>.`; pairing links are unchanged                                         |
-| `T3CODE_CENTRAL_STATE_DEBOUNCE`           | `10s`                       | Quiet time after the last history write before a push                                                                                                                   |
-| `T3CODE_CENTRAL_STATE_MIN_SPACING`        | `30s`                       | Floor on the time between push starts; values below `2s` are raised to `2s`. See [Recovery point](#recovery-point)                                                      |
-| `T3CODE_CENTRAL_STATE_MAX_INTERVAL`       | `2m`                        | Longest a history-dirty home waits during continuous activity                                                                                                           |
-| `T3CODE_CENTRAL_STATE_IDLE_INTERVAL`      | `10m`                       | Cadence for non-history DB writes and the files-only sweep                                                                                                              |
-| `T3CODE_CENTRAL_STATE_LEASE_TTL`          | `60s`                       | Lease lifetime. The holder renews every quarter of it and stops itself after a full TTL without a renewal                                                               |
-| `T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT` | `20s`                       | Bound on the shutdown push, which retries within it, and on the wait for a push already running at shutdown                                                             |
+| Variable                                   | Default                     | Meaning                                                                                                                                                                 |
+| ------------------------------------------ | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `T3CODE_CENTRAL_STATE_URL`                 | unset, meaning **disabled** | `file:///abs/dir` selects the filesystem backend. `http(s)://…` selects the HTTP backend; object keys are appended to this base URL. Any other scheme is a config error |
+| `T3CODE_CENTRAL_STATE_HOME_KEY`            | required when URL is set    | Per-developer key; one live server per key. Must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`                                                                             |
+| `T3CODE_CENTRAL_STATE_TOKEN_FILE`          | unset                       | Bearer token file, re-read on every request (HTTP only)                                                                                                                 |
+| `T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS`  | `etag`                      | `etag` (the Spaak broker, or another Bearer-token gateway) or `gcs` (GCS XML API, which uses `x-goog-generation`). S3, R2 and MinIO need SigV4 and are not supported    |
+| `T3CODE_CENTRAL_STATE_CLAUDE_HOME`         | `<baseDir>/claude`          | Absolute path. T3's Claude children use it as `CLAUDE_CONFIG_DIR`                                                                                                       |
+| `T3CODE_CENTRAL_STATE_CODEX_HOME`          | `<baseDir>/codex`           | Absolute path. T3's Codex children and terminals use it as `CODEX_HOME`                                                                                                 |
+| `T3CODE_CENTRAL_STATE_TAKEOVER`            | `false`                     | Ask a live holder to hand off instead of failing fast                                                                                                                   |
+| `T3CODE_CENTRAL_STATE_GENERATION`          | unset                       | Positive integer the session service gives each new pod of a home. See [Generations](#generations)                                                                      |
+| `T3CODE_CENTRAL_STATE_PUBLIC_URL`          | unset                       | The URL clients reach this server at. Only logged at startup, as `Serving T3 home <key> at <url>.`; pairing links are unchanged                                         |
+| `T3CODE_CENTRAL_STATE_DEBOUNCE`            | `10s`                       | Quiet time after the last history write before a push                                                                                                                   |
+| `T3CODE_CENTRAL_STATE_MIN_SPACING`         | `30s`                       | Floor on the time between push starts; values below `2s` are raised to `2s`. See [Recovery point](#recovery-point)                                                      |
+| `T3CODE_CENTRAL_STATE_MAX_INTERVAL`        | `2m`                        | Longest a history-dirty home waits during continuous activity                                                                                                           |
+| `T3CODE_CENTRAL_STATE_IDLE_INTERVAL`       | `10m`                       | Cadence for non-history DB writes and the files-only sweep                                                                                                              |
+| `T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL` | `2s`                        | How often appended transcript and rollout lines ship between pushes. `0` turns the [fast lane](#transcript-fast-lane) off                                               |
+| `T3CODE_CENTRAL_STATE_LEASE_TTL`           | `60s`                       | Lease lifetime. The holder renews every quarter of it and stops itself after a full TTL without a renewal                                                               |
+| `T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT`  | `20s`                       | Bound on the shutdown push, which retries within it, and on the wait for a push already running at shutdown                                                             |
 
 When central state is on, T3 sets `CLAUDE_CONFIG_DIR` to the Claude home and `CODEX_HOME` to the
 Codex home before the server starts, replacing any value the runner set, and creates both with mode
@@ -139,9 +165,15 @@ death still loses no history, because the debounce push has already run.
 In-flight runs reappear as "Server restarted" through the normal startup reconcile. With
 **Continue threads after restarts** on (the default), a continuation is queued. After a lossy
 restore, that continuation can repeat side effects the lost tail already performed, such as a push
-or a PR comment. Turn the setting off if that matters to you. A Claude transcript or Codex rollout
-written after the last push is missing after restore, and the thread continues through the lossy
-context handoff.
+or a PR comment. Turn the setting off if that matters to you.
+
+The [transcript fast lane](#transcript-fast-lane) protects the provider's context, not the thread.
+After a hard kill, Claude transcripts and Codex rollouts are restored to within
+`transcriptInterval` (2 s) plus one shipment of the kill, so the model resumes knowing what it did. The T3 thread, its
+messages and activity still lose up to the push interval above, so the model can remember work the
+visible thread does not show. Lines written in the last interval are missing, and a thread whose
+transcript is missing entirely, such as one started then, continues through the lossy context
+handoff. With the fast lane off, everything written after the last push is missing.
 
 Clients holding cursors from the lost range are not confused. Each restore gives the database a
 sequence floor 10⁹ above any sequence the home has issued. The existing resume guards then send
@@ -443,8 +475,9 @@ Re-check these on every upstream merge. Central state relies on them without cha
   entered in T3 settings, in every retained and pinned generation.
 - Deleting a thread is a soft delete. Its content stays in the database and in every retained
   generation and pinned generation. A purge request needs the whole home deleted from the store.
-- Pushes that crash or come from a fenced server, and garbage collection a holder skips when its
-  lease may have passed on, leave orphan blobs and history copies. v1 leaves them in place. Only a
-  reference-aware sweep may remove them: one that holds the lease, marks every blob the head, the
-  history copies and the pinned manifests reference, and deletes the rest. That sweep is future
-  work; an age-based lifecycle rule is not a substitute (see infra item 6).
+- Pushes and transcript shipments that crash or come from a fenced server, and garbage collection a
+  holder skips when its lease may have passed on, leave orphan blobs, tail chunks and history
+  copies. v1 leaves them in place. Only a reference-aware sweep may remove them: one that holds the
+  lease, marks every blob the head, the history copies and the pinned manifests reference, and
+  deletes the rest. That sweep is future work; an age-based lifecycle rule is not a substitute (see
+  infra item 6).

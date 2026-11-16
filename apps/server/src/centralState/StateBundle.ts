@@ -1109,7 +1109,8 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
 
 /**
  * Ships the transcript lines appended since the head or the last shipment, without a database
- * snapshot. True when it shipped; with nothing appended it opens no file and writes nothing.
+ * snapshot. True when it shipped. With nothing appended it opens no file and writes nothing, except
+ * once to compact a file whose tail reached the chunk cap.
  */
 export const shipTail = Effect.fn("StateBundle.shipTail")(function* (input: {
   readonly ctx: BundleContext;
