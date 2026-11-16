@@ -61,6 +61,8 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
   readonly cache: StateBundle.PushCache;
   readonly transcripts: StateBundle.TranscriptHooks;
   readonly policy: SnapshotPolicy.PolicyConfig;
+  /** How often transcript appends ship between pushes; zero turns that off. */
+  readonly transcriptInterval: Duration.Duration;
   readonly finalPushTimeout: Duration.Duration;
   readonly head: Ref.Ref<number | null>;
   /** True once the lease is lost; the loop then never pushes again. */
@@ -102,6 +104,21 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
         yield* Ref.set(input.committed, outcome.committed);
       }
       return outcome;
+    },
+    Effect.tapError((error) =>
+      isFence(error) ? Deferred.succeed(fenced, undefined) : Effect.void,
+    ),
+  );
+
+  const ship = Effect.fn("SnapshotLoop.ship")(
+    function* () {
+      return yield* StateBundle.shipTail({
+        ctx: input.ctx,
+        committed: yield* Ref.get(input.committed),
+        cache: input.cache,
+        transcripts: input.transcripts,
+        lease: input.lease,
+      });
     },
     Effect.tapError((error) =>
       isFence(error) ? Deferred.succeed(fenced, undefined) : Effect.void,
@@ -188,6 +205,25 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
         }),
       );
     });
+
+    /** One shipment of transcript appends; false ends the fast lane. */
+    const shipTick = Effect.gen(function* () {
+      if ((yield* input.isFenced) || (yield* Deferred.isDone(fenced))) return false;
+      // A push running now captures the same lines, so this round is skipped, not queued.
+      const shipped = yield* pushing.withPermitsIfAvailable(1)(Effect.result(ship()));
+      if (Option.isNone(shipped) || Result.isSuccess(shipped.value)) return true;
+      if (isFence(shipped.value.failure)) return false;
+      yield* warn("Central state transcript shipment failed; retrying.", shipped.value.failure);
+      return true;
+    });
+    if (Duration.isGreaterThan(input.transcriptInterval, Duration.zero)) {
+      yield* Effect.forkScoped(
+        Effect.repeat(shipTick, {
+          schedule: Schedule.spaced(input.transcriptInterval),
+          while: (keepGoing) => keepGoing,
+        }),
+      );
+    }
 
     yield* Effect.repeat(tick, {
       schedule: Schedule.spaced(TICK),

@@ -62,6 +62,15 @@ const setup = Effect.gen(function* () {
   const write = (relativePath: string, contents: string, flag: "w" | "a" = "w") =>
     writeAt(file(claudeHome, relativePath), contents, flag);
 
+  const upload = (input: {
+    readonly path: string;
+    readonly offset: number;
+    readonly length: number;
+  }) =>
+    Blobs.upload({ homeKey, workDir, ...input, isKnown: () => false }).pipe(
+      Effect.provideContext(services),
+    );
+
   /** Runs collect and returns the section with the number of blobs it uploaded. */
   const collectWith = <Section>(
     layout: ProviderTranscripts.Layout<Section>,
@@ -74,17 +83,22 @@ const setup = Effect.gen(function* () {
         home,
         roots: layout.roots,
         previous: layout.toFiles(previous),
-        upload: ({ path: source, offset, length }) =>
-          Blobs.upload({
-            homeKey,
-            workDir,
-            path: source,
-            offset,
-            length,
-            isKnown: () => false,
-          }).pipe(Effect.provideContext(services)),
+        upload,
       });
       return { section: layout.fromFiles(roots), uploads: counts.uploads - before };
+    });
+
+  /** Runs collectAppends past `shipped` and returns what it found with the blobs it uploaded. */
+  const appends = (shipped: typeof ClaudeSection.Type) =>
+    Effect.gen(function* () {
+      const before = counts.uploads;
+      const appended = yield* ProviderTranscripts.collectAppends({
+        home: claudeHome,
+        roots: ProviderTranscripts.claude.roots,
+        shipped: ProviderTranscripts.claude.toFiles(shipped),
+        upload,
+      });
+      return { appended, uploads: counts.uploads - before };
     });
   const collect = (previous: typeof ClaudeSection.Type, home = claudeHome) =>
     collectWith(ProviderTranscripts.claude, previous, home);
@@ -116,6 +130,7 @@ const setup = Effect.gen(function* () {
     write,
     collect,
     collectWith,
+    appends,
     stage,
     stageWith,
   };
@@ -136,8 +151,18 @@ it.layer(NodeServices.layer)("ProviderTranscripts", (it) => {
       const unchanged = yield* fixture.collect(first.section);
       assert.strictEqual(unchanged.uploads, 0);
       assert.deepStrictEqual(unchanged.section, first.section);
+      // The fast lane ships no partial line either.
+      assert.deepStrictEqual(yield* fixture.appends(first.section), { appended: {}, uploads: 0 });
 
       fixture.write(transcript, "}\n", "a");
+      const shipped = yield* fixture.appends(first.section);
+      assert.strictEqual(shipped.uploads, 1);
+      const shippedEntry = shipped.appended["projects"]?.[transcript];
+      assert.strictEqual(shippedEntry?.size, 16);
+      assert.deepStrictEqual(
+        shippedEntry?.chunks.map((chunk) => chunk.size),
+        [8],
+      );
       const appended = yield* fixture.collect(first.section);
       assert.strictEqual(appended.uploads, 1);
       const appendedEntry = appended.section.files[transcript]!;
@@ -161,6 +186,8 @@ it.layer(NodeServices.layer)("ProviderTranscripts", (it) => {
       fixture.write(transcript, "a\nb\n");
       const first = yield* fixture.collect(empty);
       fixture.write(transcript, "x\nb\nc\n");
+      // The fast lane leaves a rewritten transcript to the full push.
+      assert.deepStrictEqual(yield* fixture.appends(first.section), { appended: {}, uploads: 0 });
       const rewritten = yield* fixture.collect(first.section);
       assert.strictEqual(rewritten.uploads, 1);
       assert.deepStrictEqual(

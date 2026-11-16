@@ -42,6 +42,7 @@ import {
 } from "./Manifest.ts";
 import * as ProviderTranscripts from "./ProviderTranscripts.ts";
 import * as StateFiles from "./StateFiles.ts";
+import * as TranscriptTail from "./TranscriptTail.ts";
 
 export interface BundleContext {
   readonly homeKey: string;
@@ -68,28 +69,30 @@ export type TranscriptFiles = Readonly<
   Record<string, Readonly<Record<string, typeof TranscriptEntry.Type>>>
 >;
 
+type CollectError =
+  | CentralObjectStore.CentralObjectStoreError
+  | CentralObjectStore.CentralObjectFencedError
+  | PlatformError.PlatformError;
+type Upload = (input: {
+  readonly path: string;
+  readonly offset: number;
+  readonly length: number;
+}) => Effect.Effect<typeof BlobRef.Type, CollectError>;
+
 /** Implemented by ProviderTranscripts.ts and passed in by CentralState.ts. */
 export interface TranscriptHooks {
   readonly collect: (input: {
     readonly home: string;
     readonly roots: ReadonlyArray<string>;
     readonly previous: TranscriptFiles;
-    readonly upload: (input: {
-      readonly path: string;
-      readonly offset: number;
-      readonly length: number;
-    }) => Effect.Effect<
-      typeof BlobRef.Type,
-      | CentralObjectStore.CentralObjectStoreError
-      | CentralObjectStore.CentralObjectFencedError
-      | PlatformError.PlatformError
-    >;
-  }) => Effect.Effect<
-    TranscriptFiles,
-    | CentralObjectStore.CentralObjectStoreError
-    | CentralObjectStore.CentralObjectFencedError
-    | PlatformError.PlatformError
-  >;
+    readonly upload: Upload;
+  }) => Effect.Effect<TranscriptFiles, CollectError>;
+  readonly collectAppends: (input: {
+    readonly home: string;
+    readonly roots: ReadonlyArray<string>;
+    readonly shipped: TranscriptFiles;
+    readonly upload: Upload;
+  }) => Effect.Effect<TranscriptFiles, CollectError>;
   readonly stage: (input: {
     readonly home: string;
     readonly files: TranscriptFiles;
@@ -181,6 +184,7 @@ export interface PushCache {
   /** Committed history copies by key; immutable once committed. */
   readonly historyManifests: Map<string, Manifest>;
   lastPushedDataVersion: number | null;
+  tail: Option.Option<TranscriptTail.Stored>;
 }
 export type DbSource =
   | { readonly _tag: "Live"; readonly reader: DatabaseSnapshot.LiveReader }
@@ -337,6 +341,7 @@ const seedCache = Effect.fn("StateBundle.seedCache")(function* (
     knownBlobs: new Set(refsOf(manifest)),
     historyManifests: new Map(),
     lastPushedDataVersion: null,
+    tail: yield* TranscriptTail.read(ctx.homeKey),
   };
   return cache;
 });
@@ -390,16 +395,93 @@ const pruneAside = Effect.fn("StateBundle.pruneAside")(function* (directory: str
 /** Each provider home with the part of `manifest` that belongs in it. */
 const providerHomes = (ctx: BundleContext, manifest: Manifest) => [
   {
+    provider: "claude" as const,
     home: ctx.paths.claudeHome,
     roots: ProviderTranscripts.claude.roots,
     files: ProviderTranscripts.claude.toFiles(manifest.claude),
   },
   {
+    provider: "codex" as const,
     home: ctx.paths.codexHome,
     roots: ProviderTranscripts.codex.roots,
     files: ProviderTranscripts.codex.toFiles(manifest.codex),
   },
 ];
+
+/**
+ * A taker steals no sooner than this holder must stop, so a delete that ends inside the lease can
+ * never remove an object the next holder has just uploaded.
+ */
+// Untraced: one per deleted key, inside the caller's span.
+const removeWithinLease = Effect.fnUntraced(function* (
+  lease: Pick<HeldLease, "remainingMs">,
+  key: string,
+) {
+  const store = yield* CentralObjectStore.CentralObjectStore;
+  const remainingMs = yield* lease.remainingMs;
+  if (remainingMs <= 0) {
+    return yield* new Cause.TimeoutError("The lease may have passed to another server.");
+  }
+  yield* store.remove(key).pipe(Effect.timeout(Duration.millis(remainingMs)));
+});
+
+type TailWrite = Effect.Success<ReturnType<typeof TranscriptTail.write>>;
+
+/** Deletes the chunks the overwritten index named and the new one does not. */
+const removeTailChunks = Effect.fn("StateBundle.removeTailChunks")(function* (
+  ctx: BundleContext,
+  lease: Pick<HeldLease, "remainingMs">,
+  written: TailWrite,
+) {
+  const kept = TranscriptTail.chunksOf(written.stored.value);
+  const orphaned = [...TranscriptTail.chunksOf(written.replaced)].filter(
+    (sha256) => !kept.has(sha256),
+  );
+  yield* Effect.forEach(
+    orphaned,
+    (sha256) => removeWithinLease(lease, keys.tailChunk(ctx.homeKey, sha256)),
+    { concurrency: 4, discard: true },
+  ).pipe(
+    Effect.catch((error) =>
+      Effect.logWarning("Central state GC failed; unreferenced tail chunks may remain.").pipe(
+        Effect.annotateLogs({ homeKey: ctx.homeKey, error: error._tag }),
+      ),
+    ),
+  );
+});
+
+/**
+ * Moves a tail that extends the restored head onto the fenced one, so a restore that crashes from
+ * here on still finds it. An index that extends anything else is emptied.
+ */
+const adoptTail = Effect.fn("StateBundle.adoptTail")(function* (
+  ctx: BundleContext,
+  restored: Manifest,
+  fenced: Manifest,
+) {
+  const stored = yield* TranscriptTail.read(ctx.homeKey);
+  if (Option.isNone(stored)) return Option.none<TailWrite>();
+  const current = stored.value.value;
+  const applies = current !== null && TranscriptTail.extendsHead(current, restored);
+  if (!applies && current !== null && !TranscriptTail.isEmpty(current)) {
+    yield* Effect.logWarning(
+      "Ignored a central state transcript tail that extends another save.",
+    ).pipe(
+      Effect.annotateLogs({
+        homeKey: ctx.homeKey,
+        epoch: current.epoch,
+        generation: current.generation,
+      }),
+    );
+  }
+  const adopted = TranscriptTail.make({
+    homeKey: ctx.homeKey,
+    holderId: ctx.holder.holderId,
+    head: fenced,
+    ...(applies ? { files: current } : {}),
+  });
+  return Option.some(yield* TranscriptTail.write(ctx.homeKey, stored, adopted));
+});
 
 const restore = Effect.fn("StateBundle.restore")(function* (input: {
   readonly ctx: BundleContext;
@@ -434,20 +516,75 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
     },
     Option.some(head.version),
   );
+  let tail = yield* adoptTail(ctx, previous, fenced.manifest);
 
   const staging = path.join(ctx.paths.workDir, "tmp", `restore-${NodeCrypto.randomUUID()}`);
   const homes = providerHomes(ctx, previous).map((home) => ({
     ...home,
     stagingDir: path.join(home.home, `.central-restore-${NodeCrypto.randomUUID()}`),
   }));
-  const download = (ref: typeof BlobRef.Type, destinationPath: string, append: boolean) =>
+  const download = (
+    ref: typeof BlobRef.Type,
+    destinationPath: string,
+    append: boolean,
+    kind: Blobs.Kind = "blob",
+  ) =>
     Blobs.download({
       homeKey: ctx.homeKey,
       workDir: ctx.paths.workDir,
       ref,
       destinationPath,
       append,
+      kind,
     });
+  const stageTranscripts = (applied: TranscriptTail.Tail | null) => {
+    const tailChunks = TranscriptTail.chunksOf(applied);
+    return Effect.forEach(homes, (home) =>
+      input.transcripts.stage({
+        home: home.home,
+        files:
+          applied === null
+            ? home.files
+            : TranscriptTail.appendTo(home.files, applied[home.provider]),
+        stagingDir: home.stagingDir,
+        download: ({ ref, destinationPath, append }) =>
+          download(
+            ref,
+            destinationPath,
+            append,
+            tailChunks.has(ref.sha256) ? "tailChunk" : "blob",
+          ).pipe(Effect.provideContext(services)),
+      }),
+    );
+  };
+  // Missing or corrupt tail lines cost only the last seconds of a transcript, not the restore.
+  const withoutTail = Effect.fn("StateBundle.restoreWithoutTail")(function* (
+    error: Blobs.CentralBlobMissingError | Blobs.CentralBlobIntegrityError,
+  ) {
+    const written = Option.getOrUndefined(tail);
+    if (written === undefined || !error.key.startsWith(keys.tailChunk(ctx.homeKey, ""))) {
+      return yield* error;
+    }
+    yield* Effect.logWarning(
+      "Restored without the central state transcript tail: one of its chunks is unusable.",
+    ).pipe(Effect.annotateLogs({ homeKey: ctx.homeKey, error: error._tag }));
+    const emptied = yield* TranscriptTail.write(
+      ctx.homeKey,
+      Option.some(written.stored),
+      TranscriptTail.make({
+        homeKey: ctx.homeKey,
+        holderId: ctx.holder.holderId,
+        head: fenced.manifest,
+      }),
+    );
+    tail = Option.some({ stored: emptied.stored, replaced: written.replaced });
+    yield* Effect.forEach(
+      homes,
+      ({ stagingDir }) => fileSystem.remove(stagingDir, { recursive: true, force: true }),
+      { discard: true },
+    );
+    return yield* stageTranscripts(null);
+  });
   const files = Object.fromEntries(
     Object.entries(previous.files).filter(([relativePath]) => StateFiles.isSynced(relativePath)),
   );
@@ -483,13 +620,10 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
     }
     const now = yield* nowIso;
     yield* DatabaseSnapshot.applySequenceFloor({ path: stagedDb, floor, now });
-    const places = yield* Effect.forEach(homes, (home) =>
-      input.transcripts.stage({
-        home: home.home,
-        files: home.files,
-        stagingDir: home.stagingDir,
-        download: ({ ref, destinationPath, append }) =>
-          download(ref, destinationPath, append).pipe(Effect.provideContext(services)),
+    const places = yield* stageTranscripts(Option.getOrUndefined(tail)?.stored.value ?? null).pipe(
+      Effect.catchTags({
+        CentralBlobMissingError: withoutTail,
+        CentralBlobIntegrityError: withoutTail,
       }),
     );
 
@@ -528,6 +662,7 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
   );
 
   yield* writeMarker(ctx.paths.stateDir, markerFor(ctx, fenced.manifest));
+  if (Option.isSome(tail)) yield* removeTailChunks(ctx, input.lease, tail.value);
 
   const writtenAt = previous.committedAt === null ? Number.NaN : Date.parse(previous.committedAt);
   const age = Number.isNaN(writtenAt)
@@ -678,16 +813,8 @@ const collectGarbage = Effect.fn("StateBundle.collectGarbage")(function* (input:
   readonly cache: PushCache;
   readonly lease: Pick<HeldLease, "remainingMs">;
 }) {
-  const store = yield* CentralObjectStore.CentralObjectStore;
   const { cache } = input;
-  // A taker steals no sooner than this holder must stop, so a delete that ends inside the lease
-  // can never remove a blob the next holder has just uploaded.
-  const remove = (key: string) =>
-    Effect.flatMap(input.lease.remainingMs, (remainingMs) =>
-      remainingMs <= 0
-        ? Effect.fail(new Cause.TimeoutError("The lease may have passed to another server."))
-        : store.remove(key).pipe(Effect.timeout(Duration.millis(remainingMs))),
-    );
+  const remove = (key: string) => removeWithinLease(input.lease, key);
   const historyKey = (ref: { readonly epoch: string; readonly generation: number }) =>
     keys.history(input.homeKey, ref.epoch, ref.generation);
   const retained = new Set([...input.next.history, ...input.next.pinned].map(historyKey));
@@ -780,6 +907,24 @@ const adoptOwnHead = Effect.fn("StateBundle.adoptOwnHead")(function* (
   );
   const outcome: PushOutcome = { _tag: "Adopted", committed: head.value };
   return outcome;
+});
+
+/** A new head holds every line the tail held, so the tail starts over from it. */
+const foldTail = Effect.fn("StateBundle.foldTail")(function* (
+  ctx: BundleContext,
+  head: Manifest,
+  cache: PushCache,
+  lease: Pick<HeldLease, "remainingMs">,
+) {
+  const stored = Option.getOrUndefined(cache.tail);
+  if (stored === undefined || TranscriptTail.isEmpty(stored.value)) return;
+  const written = yield* TranscriptTail.write(
+    ctx.homeKey,
+    cache.tail,
+    TranscriptTail.make({ homeKey: ctx.homeKey, holderId: ctx.holder.holderId, head }),
+  );
+  cache.tail = Option.some(written.stored);
+  yield* removeTailChunks(ctx, lease, written);
 });
 
 export const push = Effect.fn("StateBundle.push")(function* (input: {
@@ -939,6 +1084,13 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
     for (const sha256 of refsOf(next)) cache.knownBlobs.add(sha256);
     cache.historyManifests.set(historyKey, next);
 
+    yield* foldTail(ctx, next, cache, input.lease).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning(
+          "Could not reset the central state transcript tail; the next shipment replaces it.",
+        ).pipe(Effect.annotateLogs({ error: error._tag })),
+      ),
+    );
     yield* collectGarbage({ homeKey: ctx.homeKey, previous, next, cache, lease: input.lease }).pipe(
       Effect.catch((error) =>
         Effect.logWarning("Central state GC failed; unreferenced blobs may remain.").pipe(
@@ -953,4 +1105,64 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
       fileSystem.remove(pushDir, { recursive: true, force: true }).pipe(Effect.ignore),
     ),
   );
+});
+
+/**
+ * Ships the transcript lines appended since the head or the last shipment, without a database
+ * snapshot. True when it shipped; with nothing appended it opens no file and writes nothing.
+ */
+export const shipTail = Effect.fn("StateBundle.shipTail")(function* (input: {
+  readonly ctx: BundleContext;
+  readonly committed: Committed;
+  readonly cache: PushCache;
+  readonly transcripts: TranscriptHooks;
+  readonly lease: Pick<HeldLease, "remainingMs">;
+}) {
+  const { ctx, cache } = input;
+  const head = input.committed.manifest;
+  // Restore needs a database, so it never reads the tail of a head without one.
+  if (head.database === null) return false;
+  const stored = Option.getOrUndefined(cache.tail)?.value ?? null;
+  const tail =
+    stored !== null && TranscriptTail.extendsHead(stored, head)
+      ? stored
+      : TranscriptTail.make({ homeKey: ctx.homeKey, holderId: ctx.holder.holderId, head });
+  const known = TranscriptTail.chunksOf(tail);
+  const services = yield* Effect.context<
+    CentralObjectStore.CentralObjectStore | FileSystem.FileSystem | Path.Path
+  >();
+  const upload: Upload = ({ path: file, offset, length }) =>
+    Blobs.upload({
+      homeKey: ctx.homeKey,
+      workDir: ctx.paths.workDir,
+      path: file,
+      offset,
+      length,
+      isKnown: (sha256) => known.has(sha256),
+      kind: "tailChunk",
+    }).pipe(Effect.provideContext(services));
+
+  const files = { claude: tail.claude, codex: tail.codex };
+  let appended = false;
+  for (const home of providerHomes(ctx, head)) {
+    const added = yield* input.transcripts.collectAppends({
+      home: home.home,
+      roots: home.roots,
+      shipped: TranscriptTail.shippedFiles(home.files, tail[home.provider]),
+      upload,
+    });
+    if (Object.keys(added).length === 0) continue;
+    appended = true;
+    files[home.provider] = TranscriptTail.extend(home.files, tail[home.provider], added);
+  }
+  if (!appended) return false;
+
+  const written = yield* TranscriptTail.write(
+    ctx.homeKey,
+    cache.tail,
+    TranscriptTail.make({ homeKey: ctx.homeKey, holderId: ctx.holder.holderId, head, files }),
+  );
+  cache.tail = Option.some(written.stored);
+  yield* removeTailChunks(ctx, input.lease, written);
+  return true;
 });

@@ -30,6 +30,7 @@ import * as Manifest from "./Manifest.ts";
 import * as ProviderTranscripts from "./ProviderTranscripts.ts";
 import * as SnapshotLoop from "./SnapshotLoop.ts";
 import * as StateBundle from "./StateBundle.ts";
+import * as TranscriptTail from "./TranscriptTail.ts";
 
 const homeKey = "dev";
 const occurredAt = "2026-09-03T00:00:00.000Z";
@@ -39,6 +40,7 @@ const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const noTranscripts: StateBundle.TranscriptHooks = {
   collect: () => Effect.succeed({}),
+  collectAppends: () => Effect.succeed({}),
   stage: () => Effect.succeed({ place: Effect.void }),
 };
 
@@ -96,7 +98,7 @@ const setup = Effect.gen(function* () {
     yield* Layer.build(CentralObjectStore.layerFilesystem(path.join(directory, "store"))),
     CentralObjectStore.CentralObjectStore,
   );
-  const counts = { downloads: 0, removes: [] as Array<string> };
+  const counts = { downloads: 0, removes: [] as Array<string>, writes: [] as Array<string> };
   const store = CentralObjectStore.CentralObjectStore.of({
     read: inner.read,
     download: (key, destination) =>
@@ -104,7 +106,11 @@ const setup = Effect.gen(function* () {
         counts.downloads += 1;
         return inner.download(key, destination);
       }),
-    write: inner.write,
+    write: (key, body, precondition) =>
+      Effect.suspend(() => {
+        counts.writes.push(key);
+        return inner.write(key, body, precondition);
+      }),
     remove: (key) =>
       Effect.suspend(() => {
         counts.removes.push(key);
@@ -251,7 +257,11 @@ const pushClosed = (
   holderId: string,
   committed: StateBundle.Committed,
   cache: StateBundle.PushCache,
-  options: { readonly dataVersion?: number; readonly remainingMs?: number } = {},
+  options: {
+    readonly dataVersion?: number;
+    readonly remainingMs?: number;
+    readonly transcripts?: StateBundle.TranscriptHooks;
+  } = {},
 ) =>
   fixture.run(
     StateBundle.push({
@@ -259,10 +269,37 @@ const pushClosed = (
       committed,
       cache,
       source: { _tag: "Closed", dataVersion: options.dataVersion ?? null },
-      transcripts: noTranscripts,
+      transcripts: options.transcripts ?? noTranscripts,
       lease: { remainingMs: Effect.succeed(options.remainingMs ?? 60_000) },
     }),
   );
+
+const shipTail = (
+  fixture: Fixture,
+  holderId: string,
+  prepared: { readonly committed: StateBundle.Committed; readonly cache: StateBundle.PushCache },
+  transcripts: StateBundle.TranscriptHooks,
+) =>
+  fixture.run(
+    StateBundle.shipTail({
+      ctx: fixture.context(holderId),
+      committed: prepared.committed,
+      cache: prepared.cache,
+      transcripts,
+      lease: { remainingMs: Effect.succeed(60_000) },
+    }),
+  );
+
+const storedTail = (cache: StateBundle.PushCache) => {
+  const tail = Option.getOrThrow(cache.tail).value;
+  assert.isNotNull(tail);
+  return tail!;
+};
+
+const appendAt = (file: string, contents: string) => {
+  NodeFS.mkdirSync(file.slice(0, file.lastIndexOf("/")), { recursive: true });
+  NodeFS.appendFileSync(file, contents);
+};
 
 const committedOf = (outcome: StateBundle.PushOutcome) => {
   assert.strictEqual(outcome._tag, "Committed");
@@ -581,6 +618,136 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
     }),
   );
 
+  it.effect(
+    "restores transcript lines shipped after the last push, then folds them into the next",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* setup;
+        const transcripts = yield* ProviderTranscripts.hooks;
+        const { claudeHome, codexHome } = fixture.context("a").paths;
+        const session = `${claudeHome}/projects/-work/session-a.jsonl`;
+        const rollout = `${codexHome}/sessions/2026/11/16/rollout-a.jsonl`;
+        yield* seedHome(fixture);
+        appendAt(session, '{"n":1}\n');
+        const adopted = yield* prepare(fixture, "holder-a", transcripts);
+
+        appendAt(session, '{"n":2}\n{"n":3');
+        appendAt(rollout, '{"type":"session_meta"}\n');
+        assert.isTrue(yield* shipTail(fixture, "holder-a", adopted, transcripts));
+        const shipped = storedTail(adopted.cache);
+        assert.strictEqual(shipped.generation, adopted.committed.manifest.generation);
+        assert.deepStrictEqual(
+          shipped.claude["projects"]?.["-work/session-a.jsonl"]?.chunks.map((chunk) => chunk.size),
+          [8],
+        );
+        // Nothing complete was appended since, so nothing is uploaded or written.
+        fixture.counts.writes.length = 0;
+        assert.isFalse(yield* shipTail(fixture, "holder-a", adopted, transcripts));
+        assert.deepStrictEqual(fixture.counts.writes, []);
+
+        // A hard kill: no final push.
+        fixture.wipe();
+        const restored = yield* prepare(fixture, "holder-b", transcripts);
+        assert.strictEqual(restored.mode, "restore");
+        assert.strictEqual(NodeFS.readFileSync(session, "utf8"), '{"n":1}\n{"n":2}\n');
+        assert.strictEqual(NodeFS.readFileSync(rollout, "utf8"), '{"type":"session_meta"}\n');
+        // The restorer carries the tail on its own head until its first push.
+        const adoptedTail = storedTail(restored.cache);
+        assert.strictEqual(adoptedTail.epoch, restored.committed.manifest.epoch);
+        assert.strictEqual(adoptedTail.holderId, "holder-b");
+        assert.deepStrictEqual(
+          [adoptedTail.claude, adoptedTail.codex],
+          [shipped.claude, shipped.codex],
+        );
+
+        const folded = committedOf(
+          yield* pushClosed(fixture, "holder-b", restored.committed, restored.cache, {
+            transcripts,
+          }),
+        );
+        assert.strictEqual(folded.manifest.claude.files["-work/session-a.jsonl"]?.size, 16);
+        const reset = Option.getOrThrow(yield* fixture.run(TranscriptTail.read(homeKey))).value;
+        assert.deepStrictEqual(
+          [reset?.generation, reset?.claude, reset?.codex],
+          [folded.manifest.generation, {}, {}],
+        );
+        for (const sha256 of TranscriptTail.chunksOf(shipped)) {
+          assert.isFalse(yield* fixture.objectExists(Manifest.keys.tailChunk(homeKey, sha256)));
+        }
+      }),
+  );
+
+  it.effect("ignores and deletes a transcript tail that extends another save", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const transcripts = yield* ProviderTranscripts.hooks;
+      const session = `${fixture.context("a").paths.claudeHome}/projects/-work/session-a.jsonl`;
+      yield* seedHome(fixture);
+      appendAt(session, '{"n":1}\n');
+      const adopted = yield* prepare(fixture, "holder-a", transcripts);
+      appendAt(session, '{"n":2}\n');
+      yield* shipTail(fixture, "holder-a", adopted, transcripts);
+      const shipped = storedTail(adopted.cache);
+      yield* fixture.run(
+        fixture.store.write(
+          Manifest.keys.tail(homeKey),
+          {
+            _tag: "Bytes",
+            bytes: new TextEncoder().encode(JSON.stringify({ ...shipped, epoch: "another" })),
+          },
+          { _tag: "None" },
+        ),
+      );
+
+      fixture.wipe();
+      const restored = yield* prepare(fixture, "holder-b", transcripts);
+      assert.strictEqual(NodeFS.readFileSync(session, "utf8"), '{"n":1}\n');
+      const emptied = storedTail(restored.cache);
+      assert.strictEqual(emptied.epoch, restored.committed.manifest.epoch);
+      assert.deepStrictEqual(emptied.claude, {});
+      for (const sha256 of TranscriptTail.chunksOf(shipped)) {
+        assert.isFalse(yield* fixture.objectExists(Manifest.keys.tailChunk(homeKey, sha256)));
+      }
+    }),
+  );
+
+  it.effect("lets only the head's holder write the transcript tail", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const transcripts = yield* ProviderTranscripts.hooks;
+      const session = `${fixture.context("a").paths.claudeHome}/projects/-work/session-a.jsonl`;
+      yield* seedHome(fixture);
+      appendAt(session, '{"n":1}\n');
+      const holderA = yield* prepare(fixture, "holder-a", transcripts);
+      appendAt(session, '{"n":2}\n');
+      yield* shipTail(fixture, "holder-a", holderA, transcripts);
+      const staleTail = storedTail(holderA.cache);
+
+      fixture.wipe();
+      const holderB = yield* prepare(fixture, "holder-b", transcripts);
+      const adopted = Option.getOrThrow(holderB.cache.tail);
+
+      // The superseded server cannot overwrite the tail of the server that took its home.
+      appendAt(session, '{"n":3}\n');
+      const lost = yield* Effect.flip(shipTail(fixture, "holder-a", holderA, transcripts));
+      assert.strictEqual(lost._tag, "CentralCasLostError");
+      const kept = Option.getOrThrow(yield* fixture.run(TranscriptTail.read(homeKey)));
+      assert.strictEqual(kept.version, adopted.version);
+
+      // A late write of the superseded server does not stop the holder, which writes over it.
+      yield* fixture.run(
+        fixture.store.write(
+          Manifest.keys.tail(homeKey),
+          { _tag: "Bytes", bytes: new TextEncoder().encode(JSON.stringify(staleTail)) },
+          { _tag: "None" },
+        ),
+      );
+      assert.isTrue(yield* shipTail(fixture, "holder-b", holderB, transcripts));
+      const current = Option.getOrThrow(yield* fixture.run(TranscriptTail.read(homeKey))).value;
+      assert.strictEqual(current?.holderId, "holder-b");
+    }),
+  );
+
   it.effect("never fences the head once its lease lapsed during boot", () =>
     Effect.gen(function* () {
       const fixture = yield* setup;
@@ -839,6 +1006,7 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
           cache: adopted.cache,
           transcripts: noTranscripts,
           policy: { debounceMs: 0, minSpacingMs: 2_000, maxIntervalMs: 0, idleIntervalMs: 0 },
+          transcriptInterval: Duration.seconds(2),
           finalPushTimeout: Duration.seconds(20),
           head: yield* Ref.make<number | null>(null),
           isFenced: Effect.succeed(false),
@@ -848,6 +1016,67 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
         yield* loop.stop;
         assert.isFalse(yield* loop.finalPush);
         assert.strictEqual(writes, 2);
+      }),
+    ),
+  );
+
+  it.effect("ships transcript lines between pushes, and writes nothing once fenced", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* setup;
+        const transcripts = yield* ProviderTranscripts.hooks;
+        const session = `${fixture.context("a").paths.claudeHome}/projects/-work/session-a.jsonl`;
+        yield* seedHome(fixture);
+        appendAt(session, '{"n":1}\n');
+        const adopted = yield* prepare(fixture, "holder-a", transcripts);
+        const shipped = yield* Deferred.make<void>();
+        const store = CentralObjectStore.CentralObjectStore.of({
+          ...fixture.store,
+          write: (key, body, precondition) =>
+            fixture.store
+              .write(key, body, precondition)
+              .pipe(
+                Effect.tap(() =>
+                  key === Manifest.keys.tail(homeKey)
+                    ? Deferred.succeed(shipped, undefined)
+                    : Effect.void,
+                ),
+              ),
+        });
+        const fenced = yield* Ref.make(false);
+
+        appendAt(session, '{"n":2}\n');
+        const never = 3_600_000;
+        const loop = yield* SnapshotLoop.start({
+          ctx: fixture.context("holder-a"),
+          committed: yield* Ref.make(adopted.committed),
+          cache: adopted.cache,
+          transcripts,
+          policy: {
+            debounceMs: never,
+            minSpacingMs: never,
+            maxIntervalMs: never,
+            idleIntervalMs: never,
+          },
+          transcriptInterval: Duration.seconds(2),
+          finalPushTimeout: Duration.seconds(20),
+          head: yield* Ref.make<number | null>(null),
+          isFenced: Ref.get(fenced),
+          lease: { remainingMs: Effect.succeed(60_000) },
+        }).pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, store));
+        yield* Deferred.await(shipped);
+        const tail = Option.getOrThrow(yield* fixture.run(TranscriptTail.read(homeKey))).value;
+        assert.deepStrictEqual(Object.keys(tail?.claude["projects"] ?? {}), [
+          "-work/session-a.jsonl",
+        ]);
+
+        yield* Ref.set(fenced, true);
+        appendAt(session, '{"n":3}\n');
+        fixture.counts.writes.length = 0;
+        yield* TestClock.adjust(Duration.seconds(10));
+        // Stopping waits for a shipment that holds the loop's permit.
+        yield* loop.stop;
+        assert.deepStrictEqual(fixture.counts.writes, []);
       }),
     ),
   );

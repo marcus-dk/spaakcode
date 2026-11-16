@@ -175,6 +175,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
         maxIntervalMs: Duration.toMillis(settings.maxInterval),
         idleIntervalMs: Duration.toMillis(settings.idleInterval),
       },
+      transcriptInterval: settings.transcriptInterval,
       finalPushTimeout: settings.finalPushTimeout,
       head,
       isFenced: Deferred.isDone(lease.lost),

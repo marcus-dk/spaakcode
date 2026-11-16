@@ -25,6 +25,9 @@ export const keys = {
   history: (homeKey: string, epoch: string, generation: number) =>
     `homes/${homeKey}/manifests/${epoch}/${String(generation).padStart(12, "0")}.json`,
   blob: (homeKey: string, sha256: string) => `homes/${homeKey}/blobs/${sha256}`,
+  tail: (homeKey: string) => `homes/${homeKey}/transcript-tail.json`,
+  /** Apart from blobs, so deleting a folded tail never touches a blob a manifest references. */
+  tailChunk: (homeKey: string, sha256: string) => `homes/${homeKey}/tail/${sha256}`,
 } as const;
 
 export const BlobRef = Schema.Struct({
@@ -116,6 +119,26 @@ export type Manifest = typeof Manifest.Type;
  */
 export const minReaderVersionFor = (manifest: Manifest): number =>
   Math.max(manifest.minReaderVersion, manifest.codex === undefined ? 1 : 2);
+
+export const TailEntry = Schema.Struct({
+  ...TranscriptEntry.fields,
+  /** The committed entry's size these chunks follow; 0 for a file the head lacks. */
+  baseSize: Schema.Number,
+});
+/** Keyed by root directory, then by the "/"-separated path under it. */
+const TailFiles = Schema.Record(Schema.String, Schema.Record(Schema.String, TailEntry));
+
+/** Transcript lines shipped since the head named by epoch and generation; chunks are tailChunk keys. */
+export const TranscriptTail = Schema.Struct({
+  formatVersion: Schema.Literal(1),
+  homeKey: Schema.String,
+  epoch: Schema.String,
+  generation: Schema.Number,
+  holderId: Schema.String,
+  claude: TailFiles,
+  codex: TailFiles,
+  writeNonce: Schema.String,
+});
 
 export const LeaseRecord = Schema.Struct({
   formatVersion: Schema.Literal(1),

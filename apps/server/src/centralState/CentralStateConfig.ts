@@ -34,6 +34,8 @@ export interface CentralStateSettings {
   readonly minSpacing: Duration.Duration;
   readonly maxInterval: Duration.Duration;
   readonly idleInterval: Duration.Duration;
+  /** Zero turns the transcript fast lane off. */
+  readonly transcriptInterval: Duration.Duration;
   readonly leaseTtl: Duration.Duration;
   readonly finalPushTimeout: Duration.Duration;
 }
@@ -102,6 +104,18 @@ const enabledConfig = (url: string) =>
     minSpacing: duration("T3CODE_CENTRAL_STATE_MIN_SPACING", Duration.seconds(30)),
     maxInterval: duration("T3CODE_CENTRAL_STATE_MAX_INTERVAL", Duration.minutes(2)),
     idleInterval: duration("T3CODE_CENTRAL_STATE_IDLE_INTERVAL", Duration.minutes(10)),
+    transcriptInterval: Config.schema(
+      DurationFromString,
+      "T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL",
+    ).pipe(
+      // DurationFromString needs a unit, so a bare 0 is read here.
+      Config.orElse(() =>
+        Config.Literal("0", "T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL").pipe(
+          Config.map(() => Duration.zero),
+        ),
+      ),
+      Config.withDefault(Duration.seconds(2)),
+    ),
     leaseTtl: duration("T3CODE_CENTRAL_STATE_LEASE_TTL", Duration.seconds(60)),
     finalPushTimeout: duration("T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT", Duration.seconds(20)),
   }).pipe(

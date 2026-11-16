@@ -42,17 +42,21 @@ const tailSha256 = (file: FileSystem.File, end: number) =>
         Effect.map((bytes) => NodeCrypto.createHash("sha256").update(bytes).digest("hex")),
       );
 
-/** One past the last "\n" in [0, size), or 0 when there is none. */
-const completeLinesEnd = Effect.fnUntraced(function* (file: FileSystem.File, size: number) {
+/** One past the last "\n" in [floor, size), or floor when there is none. */
+const completeLinesEnd = Effect.fnUntraced(function* (
+  file: FileSystem.File,
+  size: number,
+  floor = 0,
+) {
   let position = size;
-  while (position > 0) {
-    const start = Math.max(0, position - NEWLINE_SEARCH_BLOCK);
+  while (position > floor) {
+    const start = Math.max(floor, position - NEWLINE_SEARCH_BLOCK);
     const block = yield* readRange(file, start, position);
     const index = block.lastIndexOf(0x0a);
     if (index >= 0) return start + index + 1;
     position = start;
   }
-  return 0;
+  return floor;
 });
 
 /**
@@ -90,16 +94,12 @@ export const codex: Layout<typeof CodexSection.Type | undefined> = {
 };
 
 type CollectInput = Parameters<TranscriptHooks["collect"]>[0];
+type AppendsInput = Parameters<TranscriptHooks["collectAppends"]>[0];
 
-const collectRoot = Effect.fn("ProviderTranscripts.collectRoot")(function* (
-  input: Omit<CollectInput, "roots" | "previous"> & {
-    readonly root: string;
-    readonly previous: Readonly<Record<string, Entry>>;
-  },
-) {
+/** "/"-separated paths of the files under rootDir, sorted; symbolic links are skipped. */
+const listFiles = Effect.fnUntraced(function* (rootDir: string) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const rootDir = path.join(input.home, input.root);
   // Not readDirectory's recursive mode: it descends into symlinked directories.
   const walk = (
     relativeDir: string,
@@ -115,7 +115,30 @@ const collectRoot = Effect.fn("ProviderTranscripts.collectRoot")(function* (
       ),
       Effect.map((nested) => nested.flat()),
     );
-  const relativePaths = [...(yield* walk(""))].sort();
+  return [...(yield* walk(""))].sort();
+});
+
+const toRecord = (
+  relativePaths: ReadonlyArray<string>,
+  found: ReadonlyArray<Option.Option<Entry>>,
+) => {
+  const files: Record<string, Entry> = {};
+  for (const [index, entry] of found.entries()) {
+    if (Option.isSome(entry)) files[relativePaths[index]!] = entry.value;
+  }
+  return files;
+};
+
+const collectRoot = Effect.fn("ProviderTranscripts.collectRoot")(function* (
+  input: Omit<CollectInput, "roots" | "previous"> & {
+    readonly root: string;
+    readonly previous: Readonly<Record<string, Entry>>;
+  },
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const rootDir = path.join(input.home, input.root);
+  const relativePaths = yield* listFiles(rootDir);
 
   // Untraced: runs once per file inside this span.
   const collectFile = Effect.fnUntraced(
@@ -172,11 +195,7 @@ const collectRoot = Effect.fn("ProviderTranscripts.collectRoot")(function* (
   const collected = yield* Effect.forEach(relativePaths, (file) => collectFile(file), {
     concurrency: 4,
   });
-  const files: Record<string, Entry> = {};
-  for (const [index, entry] of collected.entries()) {
-    if (Option.isSome(entry)) files[relativePaths[index]!] = entry.value;
-  }
-  return files;
+  return toRecord(relativePaths, collected);
 });
 
 export const collect = Effect.fn("ProviderTranscripts.collect")(function* (input: CollectInput) {
@@ -185,6 +204,79 @@ export const collect = Effect.fn("ProviderTranscripts.collect")(function* (input
     collected[root] = yield* collectRoot({ ...input, root, previous: input.previous[root] ?? {} });
   }
   return collected;
+});
+
+const appendsUnder = Effect.fn("ProviderTranscripts.appendsUnder")(function* (
+  input: Omit<AppendsInput, "roots" | "shipped"> & {
+    readonly root: string;
+    readonly shipped: Readonly<Record<string, Entry>>;
+  },
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const rootDir = path.join(input.home, input.root);
+  const relativePaths = (yield* listFiles(rootDir)).filter((file) => file.endsWith(".jsonl"));
+
+  // Untraced: runs once per file inside this span.
+  const appendsOf = Effect.fnUntraced(
+    function* (
+      relativePath: string,
+    ): Effect.fn.Return<
+      Option.Option<Entry>,
+      CentralObjectStoreError | CentralObjectFencedError | PlatformError.PlatformError
+    > {
+      const absolutePath = path.join(rootDir, ...relativePath.split("/"));
+      const info = yield* fileSystem.lstat(absolutePath);
+      const shipped = input.shipped[relativePath];
+      const from = shipped?.size ?? 0;
+      if (info.type !== "File" || Number(info.size) <= from) return Option.none();
+      const mtimeMs = Option.getOrUndefined(info.mtime)?.getTime() ?? 0;
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          const file = yield* fileSystem.open(absolutePath, { flag: "r" });
+          // A rewritten file is left to the full push, which uploads it whole.
+          if (shipped !== undefined && (yield* tailSha256(file, from)) !== shipped.tailSha256) {
+            return Option.none();
+          }
+          // Reads only what was appended, so a large transcript costs no more than a small one.
+          const end = yield* completeLinesEnd(file, Number(info.size), from);
+          if (end === from) return Option.none();
+          const chunk = yield* input.upload({
+            path: absolutePath,
+            offset: from,
+            length: end - from,
+          });
+          return Option.some({
+            size: end,
+            mtimeMs,
+            tailSha256: yield* tailSha256(file, end),
+            chunks: [chunk],
+          });
+        }),
+      );
+    },
+    Effect.catchReason("PlatformError", "NotFound", () => Effect.succeedNone),
+  );
+
+  const appended = yield* Effect.forEach(relativePaths, (file) => appendsOf(file), {
+    concurrency: 4,
+  });
+  return toRecord(relativePaths, appended);
+});
+
+/**
+ * The complete lines appended to each .jsonl file past what `shipped` records, one chunk per file.
+ * Files with nothing new are left out; other files and rewritten ones wait for the full push.
+ */
+export const collectAppends = Effect.fn("ProviderTranscripts.collectAppends")(function* (
+  input: AppendsInput,
+) {
+  const appended: Record<string, Readonly<Record<string, Entry>>> = {};
+  for (const root of input.roots) {
+    const files = yield* appendsUnder({ ...input, root, shipped: input.shipped[root] ?? {} });
+    if (Object.keys(files).length > 0) appended[root] = files;
+  }
+  return appended;
 });
 
 export const stage = Effect.fn("ProviderTranscripts.stage")(function* (
@@ -236,6 +328,7 @@ export const hooks = Effect.gen(function* () {
   const services = yield* Effect.context<FileSystem.FileSystem | Path.Path>();
   const transcriptHooks: TranscriptHooks = {
     collect: (input) => collect(input).pipe(Effect.provideContext(services)),
+    collectAppends: (input) => collectAppends(input).pipe(Effect.provideContext(services)),
     stage: (input) => stage(input).pipe(Effect.provideContext(services)),
   };
   return transcriptHooks;

@@ -68,6 +68,9 @@ const isCrossDevice = (error: PlatformError.PlatformError) =>
 const temporaryPath = (path: Path.Path, workDir: string, suffix: string) =>
   path.join(workDir, "tmp", `blob-${NodeCrypto.randomUUID()}${suffix}`);
 
+/** Where a blob is stored: with the manifests' blobs, or with the transcript tail's chunks. */
+export type Kind = "blob" | "tailChunk";
+
 /**
  * Hashes and zstd-compresses [offset, offset+length) of path in one pass into a temp file under
  * workDir/tmp, then PUTs IfAbsent unless isKnown(sha256). A precondition failure means present.
@@ -79,6 +82,7 @@ export const upload = Effect.fn("Blobs.upload")(function* (input: {
   readonly offset?: number;
   readonly length?: number;
   readonly isKnown: (sha256: string) => boolean;
+  readonly kind?: Kind;
 }) {
   const store = yield* CentralObjectStore.CentralObjectStore;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -105,7 +109,7 @@ export const upload = Effect.fn("Blobs.upload")(function* (input: {
     if (input.isKnown(sha256)) return ref;
     yield* store
       .write(
-        keys.blob(input.homeKey, sha256),
+        keys[input.kind ?? "blob"](input.homeKey, sha256),
         { _tag: "File", path: compressed },
         { _tag: "IfAbsent" },
       )
@@ -124,11 +128,12 @@ export const download = Effect.fn("Blobs.download")(function* (input: {
   readonly ref: typeof BlobRef.Type;
   readonly destinationPath: string;
   readonly append: boolean;
+  readonly kind?: Kind;
 }) {
   const store = yield* CentralObjectStore.CentralObjectStore;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const key = keys.blob(input.homeKey, input.ref.sha256);
+  const key = keys[input.kind ?? "blob"](input.homeKey, input.ref.sha256);
   yield* fileSystem.makeDirectory(path.join(input.workDir, "tmp"), { recursive: true });
   const compressed = temporaryPath(path, input.workDir, ".zst");
   const plain = temporaryPath(path, input.workDir, "");
