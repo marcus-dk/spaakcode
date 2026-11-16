@@ -42,16 +42,21 @@ const STRIPPED_PREFIXES = [
   "CCR_",
 ];
 
-export interface ClaudeEnvironmentPlan {
+export interface ProviderEnvironmentPlan {
   /** Becomes CLAUDE_CONFIG_DIR. */
   readonly claudeHome: string;
+  /** Becomes CODEX_HOME, so Codex instances without their own home path use it. */
+  readonly codexHome: string;
   /** Names present in the env that will be removed. */
   readonly unset: ReadonlyArray<string>;
 }
 
 /** Pure. */
-export const plan = (env: NodeJS.ProcessEnv, claudeHome: string): ClaudeEnvironmentPlan => ({
-  claudeHome,
+export const plan = (
+  env: NodeJS.ProcessEnv,
+  homes: { readonly claudeHome: string; readonly codexHome: string },
+): ProviderEnvironmentPlan => ({
+  ...homes,
   unset: Object.keys(env)
     .filter(
       (name) =>
@@ -61,13 +66,16 @@ export const plan = (env: NodeJS.ProcessEnv, claudeHome: string): ClaudeEnvironm
 });
 
 /** Mutates HostProcess.Environment (process.env by default) before any layer reads it. */
-export const apply = Effect.fn("ClaudeProcessEnvironment.apply")(function* (
-  environmentPlan: ClaudeEnvironmentPlan,
+export const apply = Effect.fn("ProviderProcessEnvironment.apply")(function* (
+  environmentPlan: ProviderEnvironmentPlan,
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const environment = yield* HostProcess.Environment;
+  // Both homes hold the provider's login.
   yield* fileSystem.makeDirectory(environmentPlan.claudeHome, { recursive: true, mode: 0o700 });
+  yield* fileSystem.makeDirectory(environmentPlan.codexHome, { recursive: true, mode: 0o700 });
   environment.CLAUDE_CONFIG_DIR = environmentPlan.claudeHome;
+  environment.CODEX_HOME = environmentPlan.codexHome;
   for (const name of environmentPlan.unset) delete environment[name];
   if (environmentPlan.unset.length > 0) {
     yield* Effect.logInfo("Removed hosting Claude Code session variables.").pipe(

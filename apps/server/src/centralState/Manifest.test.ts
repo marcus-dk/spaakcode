@@ -160,7 +160,8 @@ it.effect.each([
 it.effect("readHead refuses a manifest that needs a newer reader", () =>
   Effect.gen(function* () {
     const memory = makeMemoryStore([]);
-    memory.seed(Manifest.keys.head("a"), JSON.stringify({ minReaderVersion: 2, formatVersion: 2 }));
+    const minReaderVersion = Manifest.MANIFEST_READER_VERSION + 1;
+    memory.seed(Manifest.keys.head("a"), JSON.stringify({ minReaderVersion, formatVersion: 2 }));
     const result = yield* Manifest.readHead("a").pipe(
       Effect.provideService(CentralObjectStore.CentralObjectStore, memory.service),
       Effect.result,
@@ -168,6 +169,6 @@ it.effect("readHead refuses a manifest that needs a newer reader", () =>
     assert.isTrue(Result.isFailure(result));
     if (Result.isSuccess(result)) return;
     assert.instanceOf(result.failure, Manifest.CentralStateUnsupportedManifestError);
-    assert.strictEqual(result.failure.minReaderVersion, 2);
+    assert.strictEqual(result.failure.minReaderVersion, minReaderVersion);
   }),
 );

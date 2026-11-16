@@ -1,4 +1,4 @@
-// @effect-diagnostics nodeBuiltinImport:off - seeds Claude transcripts with exact bytes and mtimes.
+// @effect-diagnostics nodeBuiltinImport:off - seeds provider transcripts with exact bytes and mtimes.
 import * as NodeFS from "node:fs";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -11,15 +11,17 @@ import * as Path from "effect/Path";
 
 import * as Blobs from "./Blobs.ts";
 import * as CentralObjectStore from "./CentralObjectStore.ts";
-import * as ClaudeTranscripts from "./ClaudeTranscripts.ts";
 import { TRANSCRIPT_MAX_CHUNKS, type ClaudeSection } from "./Manifest.ts";
+import * as ProviderTranscripts from "./ProviderTranscripts.ts";
 
 const homeKey = "dev";
 const transcript = "-workspace-app/0a0a0a0a-0000-4000-8000-000000000001.jsonl";
 const toolResult = "-workspace-app/0a0a0a0a-0000-4000-8000-000000000001/tool-results/out.txt";
 const empty: typeof ClaudeSection.Type = { files: {} };
+const rollout = "2026/11/16/rollout-2026-11-16T10-00-00-0a0a0a0a-0000-4000-8000-000000000002.jsonl";
+const archivedRollout = "rollout-2026-11-15T10-00-00-0a0a0a0a-0000-4000-8000-000000000003.jsonl";
 
-/** A Claude home and a filesystem store whose blob uploads are counted. */
+/** Claude and Codex homes and a filesystem store whose blob uploads are counted. */
 const setup = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -44,25 +46,34 @@ const setup = Effect.gen(function* () {
   );
   const workDir = path.join(directory, "work");
   const claudeHome = path.join(directory, "claude");
-  const file = (home: string, relativePath: string) =>
-    path.join(home, "projects", ...relativePath.split("/"));
+  const codexHome = path.join(directory, "codex");
+  /** relativePath is under <home>/projects unless a root is given. */
+  const file = (home: string, relativePath: string, root = "projects") =>
+    path.join(home, root, ...relativePath.split("/"));
 
   let mtime = 1_800_000_000;
   /** Whole seconds, so every write gets a distinct mtime. */
-  const write = (relativePath: string, contents: string, flag: "w" | "a" = "w") => {
-    NodeFS.mkdirSync(path.dirname(file(claudeHome, relativePath)), { recursive: true });
-    NodeFS.writeFileSync(file(claudeHome, relativePath), contents, { flag });
+  const writeAt = (absolutePath: string, contents: string, flag: "w" | "a" = "w") => {
+    NodeFS.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    NodeFS.writeFileSync(absolutePath, contents, { flag });
     mtime += 1;
-    NodeFS.utimesSync(file(claudeHome, relativePath), mtime, mtime);
+    NodeFS.utimesSync(absolutePath, mtime, mtime);
   };
+  const write = (relativePath: string, contents: string, flag: "w" | "a" = "w") =>
+    writeAt(file(claudeHome, relativePath), contents, flag);
 
   /** Runs collect and returns the section with the number of blobs it uploaded. */
-  const collect = (previous: typeof ClaudeSection.Type, home = claudeHome) =>
+  const collectWith = <Section>(
+    layout: ProviderTranscripts.Layout<Section>,
+    previous: Section,
+    home: string,
+  ) =>
     Effect.gen(function* () {
       const before = counts.uploads;
-      const section = yield* ClaudeTranscripts.collect({
-        claudeHome: home,
-        previous,
+      const roots = yield* ProviderTranscripts.collect({
+        home,
+        roots: layout.roots,
+        previous: layout.toFiles(previous),
         upload: ({ path: source, offset, length }) =>
           Blobs.upload({
             homeKey,
@@ -73,13 +84,19 @@ const setup = Effect.gen(function* () {
             isKnown: () => false,
           }).pipe(Effect.provideContext(services)),
       });
-      return { section, uploads: counts.uploads - before };
+      return { section: layout.fromFiles(roots), uploads: counts.uploads - before };
     });
+  const collect = (previous: typeof ClaudeSection.Type, home = claudeHome) =>
+    collectWith(ProviderTranscripts.claude, previous, home);
 
-  const stage = (section: typeof ClaudeSection.Type, home: string) =>
-    ClaudeTranscripts.stage({
-      claudeHome: home,
-      section,
+  const stageWith = <Section>(
+    layout: ProviderTranscripts.Layout<Section>,
+    section: Section,
+    home: string,
+  ) =>
+    ProviderTranscripts.stage({
+      home,
+      files: layout.toFiles(section),
       stagingDir: path.join(home, ".central-restore-test"),
       download: ({ ref, destinationPath, append }) =>
         Blobs.download({ homeKey, workDir, ref, destinationPath, append }).pipe(
@@ -87,10 +104,24 @@ const setup = Effect.gen(function* () {
         ),
     });
 
-  return { directory, claudeHome, file, write, collect, stage };
+  const stage = (section: typeof ClaudeSection.Type, home: string) =>
+    stageWith(ProviderTranscripts.claude, section, home);
+
+  return {
+    directory,
+    claudeHome,
+    codexHome,
+    file,
+    writeAt,
+    write,
+    collect,
+    collectWith,
+    stage,
+    stageWith,
+  };
 });
 
-it.layer(NodeServices.layer)("ClaudeTranscripts", (it) => {
+it.layer(NodeServices.layer)("ProviderTranscripts", (it) => {
   it.effect("uploads only complete appended lines and reuses earlier chunks", () =>
     Effect.gen(function* () {
       const fixture = yield* setup;
@@ -173,6 +204,36 @@ it.layer(NodeServices.layer)("ClaudeTranscripts", (it) => {
       const second = yield* fixture.collect(first.section);
       assert.strictEqual(second.uploads, 0);
       assert.deepStrictEqual(Object.keys(second.section.files), [toolResult]);
+
+      // Codex's login, config, history, logs and state database never leave the machine.
+      const path = yield* Path.Path;
+      for (const name of [
+        "auth.json",
+        "auth.lock",
+        "config.toml",
+        "history.jsonl",
+        "session_index.jsonl",
+        "state_5.sqlite",
+        "log/codex-tui.log",
+        "shell_snapshots/snapshot.sh",
+      ]) {
+        fixture.writeAt(path.join(fixture.codexHome, name), "local\n");
+      }
+      const none = yield* fixture.collectWith(
+        ProviderTranscripts.codex,
+        undefined,
+        fixture.codexHome,
+      );
+      assert.isUndefined(none.section);
+      fixture.writeAt(fixture.file(fixture.codexHome, rollout, "sessions"), "a\n");
+      fixture.writeAt(fixture.file(fixture.codexHome, archivedRollout, "archived_sessions"), "b\n");
+      const codex = yield* fixture.collectWith(
+        ProviderTranscripts.codex,
+        undefined,
+        fixture.codexHome,
+      );
+      assert.deepStrictEqual(Object.keys(codex.section?.sessions ?? {}), [rollout]);
+      assert.deepStrictEqual(Object.keys(codex.section?.archivedSessions ?? {}), [archivedRollout]);
     }),
   );
 
@@ -209,6 +270,31 @@ it.layer(NodeServices.layer)("ClaudeTranscripts", (it) => {
       const next = yield* fixture.collect(section, restoredHome);
       assert.strictEqual(next.uploads, 0);
       assert.deepStrictEqual(next.section, section);
+
+      const codexRollout = fixture.file(fixture.codexHome, rollout, "sessions");
+      fixture.writeAt(codexRollout, '{"type":"session_meta"}\n{"type":"response_item"}\npartial');
+      fixture.writeAt(fixture.file(fixture.codexHome, archivedRollout, "archived_sessions"), "x\n");
+      const codex = (yield* fixture.collectWith(
+        ProviderTranscripts.codex,
+        undefined,
+        fixture.codexHome,
+      )).section;
+      const restoredCodex = path.join(fixture.directory, "restored-codex");
+      yield* (yield* fixture.stageWith(ProviderTranscripts.codex, codex, restoredCodex)).place;
+      assert.strictEqual(
+        NodeFS.readFileSync(fixture.file(restoredCodex, rollout, "sessions"), "utf8"),
+        '{"type":"session_meta"}\n{"type":"response_item"}\n',
+      );
+      assert.strictEqual(
+        NodeFS.readFileSync(
+          fixture.file(restoredCodex, archivedRollout, "archived_sessions"),
+          "utf8",
+        ),
+        "x\n",
+      );
+      const nextCodex = yield* fixture.collectWith(ProviderTranscripts.codex, codex, restoredCodex);
+      assert.strictEqual(nextCodex.uploads, 0);
+      assert.deepStrictEqual(nextCodex.section, codex);
     }),
   );
 });

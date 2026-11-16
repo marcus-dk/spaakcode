@@ -292,6 +292,7 @@ it.layer(NodeServices.layer)("CentralState.supervise", (it) => {
       assert.deepStrictEqual(view.events, [{ sequence: 1, eventId: "event:1" }]);
       assert.isFalse(NodeFS.existsSync(`${config.stateDir}/central-state`));
       assert.isFalse(NodeFS.existsSync(`${config.baseDir}/claude`));
+      assert.isFalse(NodeFS.existsSync(`${config.baseDir}/codex`));
     }),
   );
 
@@ -306,6 +307,7 @@ it.layer(NodeServices.layer)("CentralState.supervise", (it) => {
       const environmentId = NodeFS.readFileSync(config.environmentIdPath, "utf8");
       const saved = yield* fixture.head();
       assert.strictEqual(saved.manifest.database?.maxSequence, 3);
+      assert.strictEqual(saved.manifest.paths.codexHome, `${config.baseDir}/codex`);
       assert.isNull((yield* fixture.lease()).value.holder);
 
       // Another pod: the same paths, nothing on disk.

@@ -9,8 +9,13 @@ import * as Path from "effect/Path";
 import type * as PlatformError from "effect/PlatformError";
 
 import type { CentralObjectFencedError, CentralObjectStoreError } from "./CentralObjectStore.ts";
-import { TRANSCRIPT_MAX_CHUNKS, type TranscriptEntry } from "./Manifest.ts";
-import type { ClaudeHooks } from "./StateBundle.ts";
+import {
+  type ClaudeSection,
+  type CodexSection,
+  TRANSCRIPT_MAX_CHUNKS,
+  type TranscriptEntry,
+} from "./Manifest.ts";
+import type { TranscriptHooks, TranscriptFiles } from "./StateBundle.ts";
 import { isSafeRelativePath } from "./StateFiles.ts";
 
 const NEWLINE_SEARCH_BLOCK = 64 * 1024;
@@ -50,18 +55,51 @@ const completeLinesEnd = Effect.fnUntraced(function* (file: FileSystem.File, siz
   return 0;
 });
 
-/** The synced directories under the Claude home: transcripts, and the task lists sessions keep. */
-type Root = "projects" | "tasks";
+/**
+ * The directories of a provider home that let its threads resume natively, and how they map onto
+ * the provider's manifest section. Nothing else in the home is read, so logins (Codex's auth.json
+ * and auth.lock), caches, logs and the provider's own databases stay on the machine.
+ */
+export interface Layout<Section> {
+  readonly roots: ReadonlyArray<string>;
+  readonly toFiles: (section: Section) => TranscriptFiles;
+  readonly fromFiles: (files: TranscriptFiles) => Section;
+}
 
-const collectRoot = Effect.fn("ClaudeTranscripts.collectRoot")(function* (
-  input: Omit<Parameters<ClaudeHooks["collect"]>[0], "previous"> & {
-    readonly root: Root;
+const hasFiles = (files: Readonly<Record<string, Entry>>) => Object.keys(files).length > 0;
+
+export const claude: Layout<typeof ClaudeSection.Type> = {
+  // Claude's TaskGet and TaskUpdate read <claudeHome>/tasks/<session id> back on resume.
+  roots: ["projects", "tasks"],
+  toFiles: (section) => ({ projects: section.files, tasks: section.tasks ?? {} }),
+  fromFiles: ({ projects = {}, tasks = {} }) =>
+    hasFiles(tasks) ? { files: projects, tasks } : { files: projects },
+};
+
+export const codex: Layout<typeof CodexSection.Type | undefined> = {
+  // thread/resume looks a rollout up by thread id under sessions/, or archived_sessions/ once archived.
+  roots: ["sessions", "archived_sessions"],
+  toFiles: (section) => ({
+    sessions: section?.sessions ?? {},
+    archived_sessions: section?.archivedSessions ?? {},
+  }),
+  fromFiles: ({ sessions = {}, archived_sessions: archivedSessions = {} }) => {
+    if (!hasFiles(sessions) && !hasFiles(archivedSessions)) return undefined;
+    return hasFiles(archivedSessions) ? { sessions, archivedSessions } : { sessions };
+  },
+};
+
+type CollectInput = Parameters<TranscriptHooks["collect"]>[0];
+
+const collectRoot = Effect.fn("ProviderTranscripts.collectRoot")(function* (
+  input: Omit<CollectInput, "roots" | "previous"> & {
+    readonly root: string;
     readonly previous: Readonly<Record<string, Entry>>;
   },
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const rootDir = path.join(input.claudeHome, input.root);
+  const rootDir = path.join(input.home, input.root);
   // Not readDirectory's recursive mode: it descends into symlinked directories.
   const walk = (
     relativeDir: string,
@@ -127,7 +165,7 @@ const collectRoot = Effect.fn("ClaudeTranscripts.collectRoot")(function* (
         }),
       );
     },
-    // Claude deletes and rotates files while a push runs.
+    // Providers delete, rotate and archive files while a push runs.
     Effect.catchReason("PlatformError", "NotFound", () => Effect.succeedNone),
   );
 
@@ -141,35 +179,25 @@ const collectRoot = Effect.fn("ClaudeTranscripts.collectRoot")(function* (
   return files;
 });
 
-export const collect = Effect.fn("ClaudeTranscripts.collect")(function* (
-  input: Parameters<ClaudeHooks["collect"]>[0],
-) {
-  const files = yield* collectRoot({ ...input, root: "projects", previous: input.previous.files });
-  // Claude's TaskGet and TaskUpdate read <claudeHome>/tasks/<session id> back on resume.
-  const tasks = yield* collectRoot({
-    ...input,
-    root: "tasks",
-    previous: input.previous.tasks ?? {},
-  });
-  return Object.keys(tasks).length === 0 ? { files } : { files, tasks };
+export const collect = Effect.fn("ProviderTranscripts.collect")(function* (input: CollectInput) {
+  const collected: Record<string, Readonly<Record<string, Entry>>> = {};
+  for (const root of input.roots) {
+    collected[root] = yield* collectRoot({ ...input, root, previous: input.previous[root] ?? {} });
+  }
+  return collected;
 });
 
-export const stage = Effect.fn("ClaudeTranscripts.stage")(function* (
-  input: Parameters<ClaudeHooks["stage"]>[0],
+export const stage = Effect.fn("ProviderTranscripts.stage")(function* (
+  input: Parameters<TranscriptHooks["stage"]>[0],
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const entries = (
-    [
-      ["projects", input.section.files],
-      ["tasks", input.section.tasks ?? {}],
-    ] as const
-  ).flatMap(([root, files]) =>
+  const entries = Object.entries(input.files).flatMap(([root, files]) =>
     Object.entries(files)
       .filter(([relativePath]) => isSafeRelativePath(relativePath))
       .map(([relativePath, entry]) => ({ root, relativePath, entry })),
   );
-  const staged = (root: Root, relativePath: string) =>
+  const staged = (root: string, relativePath: string) =>
     path.join(input.stagingDir, root, ...relativePath.split("/"));
 
   yield* Effect.forEach(
@@ -191,7 +219,7 @@ export const stage = Effect.fn("ClaudeTranscripts.stage")(function* (
 
   const place = Effect.gen(function* () {
     for (const { root, relativePath, entry } of entries) {
-      const target = path.join(input.claudeHome, root, ...relativePath.split("/"));
+      const target = path.join(input.home, root, ...relativePath.split("/"));
       yield* fileSystem.makeDirectory(path.dirname(target), { recursive: true });
       yield* fileSystem.rename(staged(root, relativePath), target);
       // A Date, not a number: Node reads numbers as seconds, and float seconds lose the exact milliseconds.
@@ -199,16 +227,16 @@ export const stage = Effect.fn("ClaudeTranscripts.stage")(function* (
       yield* fileSystem.utimes(target, mtime, mtime);
     }
     yield* fileSystem.remove(input.stagingDir, { recursive: true, force: true });
-  }).pipe(Effect.withSpan("ClaudeTranscripts.place"));
+  }).pipe(Effect.withSpan("ProviderTranscripts.place"));
   return { place };
 });
 
-/** ClaudeHooks run inside StateBundle with no requirements, so they close over these services. */
+/** TranscriptHooks run inside StateBundle with no requirements, so they close over these services. */
 export const hooks = Effect.gen(function* () {
   const services = yield* Effect.context<FileSystem.FileSystem | Path.Path>();
-  const claudeHooks: ClaudeHooks = {
+  const transcriptHooks: TranscriptHooks = {
     collect: (input) => collect(input).pipe(Effect.provideContext(services)),
     stage: (input) => stage(input).pipe(Effect.provideContext(services)),
   };
-  return claudeHooks;
+  return transcriptHooks;
 });

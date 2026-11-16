@@ -24,8 +24,8 @@ import {
   CentralStateConfigError,
   centralStateConfig,
 } from "./CentralStateConfig.ts";
-import * as ClaudeProcessEnvironment from "./ClaudeProcessEnvironment.ts";
-import * as ClaudeTranscripts from "./ClaudeTranscripts.ts";
+import * as ProviderProcessEnvironment from "./ProviderProcessEnvironment.ts";
+import * as ProviderTranscripts from "./ProviderTranscripts.ts";
 import * as SnapshotLoop from "./SnapshotLoop.ts";
 import * as StateBundle from "./StateBundle.ts";
 
@@ -95,9 +95,12 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
   const settings = loaded.value;
   const path = yield* Path.Path;
 
-  const claudeHome = settings.claudeHome ?? path.join(config.baseDir, "claude");
-  yield* ClaudeProcessEnvironment.apply(
-    ClaudeProcessEnvironment.plan(yield* HostProcess.Environment, claudeHome),
+  const homes = {
+    claudeHome: settings.claudeHome ?? path.join(config.baseDir, "claude"),
+    codexHome: settings.codexHome ?? path.join(config.baseDir, "codex"),
+  };
+  yield* ProviderProcessEnvironment.apply(
+    ProviderProcessEnvironment.plan(yield* HostProcess.Environment, homes),
   );
 
   const ctx: StateBundle.BundleContext = {
@@ -116,7 +119,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
       stateDir: config.stateDir,
       dbPath: config.dbPath,
       attachmentsDir: config.attachmentsDir,
-      claudeHome,
+      ...homes,
       workDir: path.join(config.stateDir, "central-state"),
     },
   };
@@ -133,7 +136,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
 
   return yield* Effect.gen(function* () {
     const outerScope = yield* Scope.Scope;
-    const claude = yield* ClaudeTranscripts.hooks;
+    const transcripts = yield* ProviderTranscripts.hooks;
     const head = yield* Ref.make<number | null>(null);
 
     // The local lock comes first, so a home in use here fails fast and restore never moves files
@@ -148,7 +151,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
           takeover: settings.takeover,
           heartbeat: Ref.get(head),
         }).pipe(Scope.provide(outerScope));
-        const prepared = yield* StateBundle.prepareHome({ ctx, lease, claude }).pipe(
+        const prepared = yield* StateBundle.prepareHome({ ctx, lease, transcripts }).pipe(
           Effect.onError(() => lease.release),
           Effect.catchTags({
             CentralObjectFencedError: () => Effect.fail(fencedError("superseded")),
@@ -165,7 +168,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
       ctx,
       committed: yield* Ref.make(prepared.committed),
       cache: prepared.cache,
-      claude,
+      transcripts,
       policy: {
         debounceMs: Duration.toMillis(settings.debounce),
         minSpacingMs: Duration.toMillis(settings.minSpacing),

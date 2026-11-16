@@ -59,7 +59,7 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
   readonly ctx: StateBundle.BundleContext;
   readonly committed: Ref.Ref<StateBundle.Committed>;
   readonly cache: StateBundle.PushCache;
-  readonly claude: StateBundle.ClaudeHooks;
+  readonly transcripts: StateBundle.TranscriptHooks;
   readonly policy: SnapshotPolicy.PolicyConfig;
   readonly finalPushTimeout: Duration.Duration;
   readonly head: Ref.Ref<number | null>;
@@ -95,7 +95,7 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
         committed: yield* Ref.get(input.committed),
         cache: input.cache,
         source,
-        claude: input.claude,
+        transcripts: input.transcripts,
         lease: input.lease,
       });
       if (outcome._tag === "Committed" || outcome._tag === "Adopted") {

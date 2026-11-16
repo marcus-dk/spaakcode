@@ -14,7 +14,7 @@ import * as Schema from "effect/Schema";
 
 import * as CentralObjectStore from "./CentralObjectStore.ts";
 
-export const MANIFEST_READER_VERSION = 1;
+export const MANIFEST_READER_VERSION = 2;
 export const RETAIN_GENERATIONS = 10;
 export const RETAIN_PINNED = 2;
 export const TRANSCRIPT_MAX_CHUNKS = 64;
@@ -47,6 +47,12 @@ export const ClaudeSection = Schema.Struct({
   files: Schema.Record(Schema.String, TranscriptEntry),
   /** Claude's per-session task lists, keyed by the "/"-separated path under <claudeHome>/tasks. */
   tasks: Schema.optionalKey(Schema.Record(Schema.String, TranscriptEntry)),
+});
+export const CodexSection = Schema.Struct({
+  /** Codex rollouts, keyed by the "/"-separated path under <codexHome>/sessions. */
+  sessions: Schema.Record(Schema.String, TranscriptEntry),
+  /** Keyed by the "/"-separated path under <codexHome>/archived_sessions. */
+  archivedSessions: Schema.optionalKey(Schema.Record(Schema.String, TranscriptEntry)),
 });
 export const MigrationRow = Schema.Struct({ id: Schema.Number, name: Schema.String });
 export const DatabaseRef = Schema.Struct({
@@ -87,6 +93,7 @@ export const Manifest = Schema.Struct({
     baseDir: Schema.String,
     stateDir: Schema.String,
     claudeHome: Schema.String,
+    codexHome: Schema.optionalKey(Schema.String),
   }),
   /** Highest sequence floor ever reserved for this home. */
   sequenceFloor: Schema.Number,
@@ -94,12 +101,21 @@ export const Manifest = Schema.Struct({
   /** Keyed by the "/"-separated path under stateDir. */
   files: Schema.Record(Schema.String, StateFileEntry),
   claude: ClaudeSection,
+  /** Absent until the Codex home holds a session. */
+  codex: Schema.optionalKey(CodexSection),
   /** Newest first; includes this generation once committed. */
   history: Schema.Array(HistoryRef),
   pinned: Schema.Array(PinnedRef),
   writeNonce: Schema.String,
 });
 export type Manifest = typeof Manifest.Type;
+
+/**
+ * The oldest reader that keeps everything in `manifest`. A version 1 reader decodes a codex section
+ * away, so its next push would drop the Codex sessions and its GC delete their blobs.
+ */
+export const minReaderVersionFor = (manifest: Manifest): number =>
+  Math.max(manifest.minReaderVersion, manifest.codex === undefined ? 1 : 2);
 
 export const LeaseRecord = Schema.Struct({
   formatVersion: Schema.Literal(1),

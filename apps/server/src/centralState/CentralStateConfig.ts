@@ -27,6 +27,8 @@ export interface CentralStateSettings {
   readonly publicUrl: string | undefined;
   /** Absolute; undefined means <baseDir>/claude. */
   readonly claudeHome: string | undefined;
+  /** Absolute; undefined means <baseDir>/codex. */
+  readonly codexHome: string | undefined;
   readonly takeover: boolean;
   readonly debounce: Duration.Duration;
   readonly minSpacing: Duration.Duration;
@@ -94,6 +96,7 @@ const enabledConfig = (url: string) =>
       Config.withDefault("etag" as const),
     ),
     claudeHome: optionalString("T3CODE_CENTRAL_STATE_CLAUDE_HOME"),
+    codexHome: optionalString("T3CODE_CENTRAL_STATE_CODEX_HOME"),
     takeover: Config.Boolean("T3CODE_CENTRAL_STATE_TAKEOVER").pipe(Config.withDefault(false)),
     debounce: duration("T3CODE_CENTRAL_STATE_DEBOUNCE", Duration.seconds(10)),
     minSpacing: duration("T3CODE_CENTRAL_STATE_MIN_SPACING", Duration.seconds(30)),
@@ -102,9 +105,12 @@ const enabledConfig = (url: string) =>
     leaseTtl: duration("T3CODE_CENTRAL_STATE_LEASE_TTL", Duration.seconds(60)),
     finalPushTimeout: duration("T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT", Duration.seconds(20)),
   }).pipe(
-    Config.mapEffect(({ tokenFile, preconditions, claudeHome, minSpacing, ...rest }) => {
+    Config.mapEffect(({ tokenFile, preconditions, claudeHome, codexHome, minSpacing, ...rest }) => {
       if (claudeHome !== undefined && !NodePath.isAbsolute(claudeHome)) {
         return invalid("T3CODE_CENTRAL_STATE_CLAUDE_HOME must be an absolute path.");
+      }
+      if (codexHome !== undefined && !NodePath.isAbsolute(codexHome)) {
+        return invalid("T3CODE_CENTRAL_STATE_CODEX_HOME must be an absolute path.");
       }
       if (rest.generation !== undefined && rest.generation < 1) {
         return invalid("T3CODE_CENTRAL_STATE_GENERATION must be a positive integer.");
@@ -115,6 +121,7 @@ const enabledConfig = (url: string) =>
           ...rest,
           store,
           claudeHome,
+          codexHome,
           minSpacing: Duration.max(minSpacing, MIN_SPACING_FLOOR),
         }),
       );

@@ -12,7 +12,7 @@ unless `T3CODE_CENTRAL_STATE_URL` is set.
 A home is stored as a **state bundle** under `homes/<homeKey>/` in the store:
 
 - `blobs/<sha256>`: content-addressed, zstd-compressed files. They hold database snapshots, state
-  files and Claude transcript chunks.
+  files and Claude and Codex transcript chunks.
 - `manifest.json`: the head. A compare-and-swap write of this file is the only commit point, and
   it also fences out older servers.
 - `manifests/<epoch>/<generation>.json`: history copies of the last 10 generations, plus the last
@@ -30,7 +30,12 @@ The bundle carries:
   variables such as provider API keys;
 - `attachments/`, without pending uploads and `.part` files;
 - the Claude transcripts under `<claudeHome>/projects/`, so Claude threads resume natively, and
-  the task lists under `<claudeHome>/tasks/` that Claude's task tools read back on resume.
+  the task lists under `<claudeHome>/tasks/` that Claude's task tools read back on resume;
+- the Codex rollouts under `<codexHome>/sessions/` and `<codexHome>/archived_sessions/`, so Codex
+  threads resume natively.
+
+Transcripts and rollouts are uploaded append-only: a push sends only the complete lines added since
+the last one.
 
 Symbolic links under the T3 home are never followed or synced, so a symlinked `settings.json`,
 theme or secret stays behind.
@@ -42,13 +47,19 @@ It does **not** carry:
 - **`refs/t3/*` checkpoint refs.** Full diffs and rollback of restored turns fail.
 - `<baseDir>/scratch` and `<baseDir>/projects`.
 - Terminal scrollback and logs.
-- Codex and the other provider homes.
-- The `homePath` of a custom Claude instance. Only the default instance uses the synced Claude
-  home.
+- The other provider homes.
+- The `homePath` of a custom Claude instance, and the **CODEX_HOME path** of a custom Codex
+  instance. Only instances without one use the synced homes. A Codex **ChatGPT connection**
+  (managed setup) does not read `CODEX_HOME` and keeps its sessions in `~/.codex`, so they do not
+  move.
 - Claude's own login in the Claude home (its OAuth or credentials file). Supply it per developer
   with `CLAUDE_CODE_OAUTH_TOKEN`, or with an API key, Bedrock or Vertex. Keys set as provider
   environment variables in T3 settings are in `secrets/` and are synced.
 - Other Claude state, such as `plans/`. Plan-mode files mostly repeat what the transcript holds.
+- Codex's login and everything else in the Codex home: `auth.json`, `auth.lock`, `config.toml`,
+  `history.jsonl`, `session_index.jsonl`, its state database (`state_*.sqlite`), logs and caches.
+  Write `auth.json` into the Codex home on every pod, or supply `OPENAI_API_KEY`. Codex rebuilds
+  its state database from the rollouts.
 
 ## Environment variables
 
@@ -61,6 +72,7 @@ Central state is configured through environment variables only. There are no CLI
 | `T3CODE_CENTRAL_STATE_TOKEN_FILE`         | unset                       | Bearer token file, re-read on every request (HTTP only)                                                                                                                 |
 | `T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS` | `etag`                      | `etag` (the Spaak broker, or another Bearer-token gateway) or `gcs` (GCS XML API, which uses `x-goog-generation`). S3, R2 and MinIO need SigV4 and are not supported    |
 | `T3CODE_CENTRAL_STATE_CLAUDE_HOME`        | `<baseDir>/claude`          | Absolute path. T3's Claude children use it as `CLAUDE_CONFIG_DIR`                                                                                                       |
+| `T3CODE_CENTRAL_STATE_CODEX_HOME`         | `<baseDir>/codex`           | Absolute path. T3's Codex children and terminals use it as `CODEX_HOME`                                                                                                 |
 | `T3CODE_CENTRAL_STATE_TAKEOVER`           | `false`                     | Ask a live holder to hand off instead of failing fast                                                                                                                   |
 | `T3CODE_CENTRAL_STATE_GENERATION`         | unset                       | Positive integer the session service gives each new pod of a home. See [Generations](#generations)                                                                      |
 | `T3CODE_CENTRAL_STATE_PUBLIC_URL`         | unset                       | The URL clients reach this server at. Only logged at startup, as `Serving T3 home <key> at <url>.`; pairing links are unchanged                                         |
@@ -71,10 +83,11 @@ Central state is configured through environment variables only. There are no CLI
 | `T3CODE_CENTRAL_STATE_LEASE_TTL`          | `60s`                       | Lease lifetime. The holder renews every quarter of it and stops itself after a full TTL without a renewal                                                               |
 | `T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT` | `20s`                       | Bound on the shutdown push, which retries within it, and on the wait for a push already running at shutdown                                                             |
 
-When central state is on, T3 sets `CLAUDE_CONFIG_DIR` to the Claude home before the server starts.
-It also removes the variables that bind a process to the runner's own Claude Code session
+When central state is on, T3 sets `CLAUDE_CONFIG_DIR` to the Claude home and `CODEX_HOME` to the
+Codex home before the server starts, replacing any value the runner set, and creates both with mode
+`0700`. It also removes the variables that bind a process to the runner's own Claude Code session
 (`CLAUDECODE`, `CLAUDE_CODE_SESSION_*`, `CLAUDE_CODE_REMOTE*`, `CCR_*` and the others in
-`ClaudeProcessEnvironment.ts`). Terminals and Claude children inherit the result. It keeps
+`ProviderProcessEnvironment.ts`). Terminals and provider children inherit the result. It keeps
 `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_*`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and
 `CLAUDE_CODE_MAX_RETRIES`.
 
@@ -85,12 +98,14 @@ therefore be the same on every machine that serves a home:
 
 - `T3CODE_HOME` (the base dir, and the state dir below it);
 - the Claude home;
+- the Codex home, once it holds a rollout, because Codex threads are grouped by their home path;
 - the repository checkout paths of every project.
 
-Restore refuses a different `baseDir`, `stateDir` or Claude home before it downloads anything. The
-error is `CentralStatePathMismatchError`, and it names the field with its recorded and current
-values. To recover, set `T3CODE_HOME` or `T3CODE_CENTRAL_STATE_CLAUDE_HOME` to the recorded value
-and start again. Restore does not check checkout paths. Clone each project to the same path,
+Restore refuses a different `baseDir`, `stateDir` or Claude home, and a different Codex home when
+the save holds Codex rollouts, before it downloads anything. The error is
+`CentralStatePathMismatchError`, and it names the field with its recorded and current values. To
+recover, set `T3CODE_HOME`, `T3CODE_CENTRAL_STATE_CLAUDE_HOME` or `T3CODE_CENTRAL_STATE_CODEX_HOME`
+to the recorded value and start again. Restore does not check checkout paths. Clone each project to the same path,
 otherwise its threads point at a missing directory.
 
 ## Recovery point
@@ -124,9 +139,9 @@ death still loses no history, because the debounce push has already run.
 In-flight runs reappear as "Server restarted" through the normal startup reconcile. With
 **Continue threads after restarts** on (the default), a continuation is queued. After a lossy
 restore, that continuation can repeat side effects the lost tail already performed, such as a push
-or a PR comment. Turn the setting off if that matters to you. A Claude transcript written after
-the last push is missing after restore, and the thread continues through the lossy context
-handoff.
+or a PR comment. Turn the setting off if that matters to you. A Claude transcript or Codex rollout
+written after the last push is missing after restore, and the thread continues through the lossy
+context handoff.
 
 Clients holding cursors from the lost range are not confused. Each restore gives the database a
 sequence floor 10⁹ above any sequence the home has issued. The existing resume guards then send
@@ -302,9 +317,9 @@ Ranked by how likely each is to bite a team, worst first.
 6. **Clients follow the URL, not the developer.** A restored home keeps its environment id and
    auth, so paired devices keep working, but only if they can reach the new pod. Without a stable
    per-developer host, each device must add every new session URL as a route.
-7. **Provider coverage is Claude only.** Only `claude` is installed on runners, and only the
-   default Claude instance's home is synced. Codex and other providers need installing on each pod,
-   and their sessions and logins do not move.
+7. **Provider coverage is Claude and Codex.** Only `claude` is installed on runners. Only the
+   default Claude and Codex instances' homes are synced, and no provider login moves. Other
+   providers need installing on each pod, and their sessions do not move.
 8. **Code does not move.** Worktrees, unpushed commits and `refs/t3/*` stay on the old pod.
    The runner's own checkpoint covers only `/workspace/spaak-technologies/*` repos and never covers
    `refs/t3/*`.
@@ -314,7 +329,10 @@ Ranked by how likely each is to bite a team, worst first.
 10. **No attribution.** History records `user`, `agent` or `system`, never which developer acted,
     and T3 has no audit log. One home per developer is the only attribution there is.
 11. **Version skew.** A newer image migrates the home, and older images then refuse it with
-    `CentralStateMigrationRefusedError`. Pin one image for everyone.
+    `CentralStateMigrationRefusedError`. Once a save holds Codex rollouts, its manifest needs reader
+    version 2, and images from before Codex sync refuse it with
+    `CentralStateUnsupportedManifestError` instead of dropping the rollouts on their next push. Pin
+    one image for everyone.
 12. **No hosted T3 Connect.** The hosted relay can mint full-scope sessions on a linked environment
     and makes the pod reachable from the internet. Keep `"connect": false`. Peer links break when a
     peer's URL changes, so relink them after a move.
@@ -347,7 +365,9 @@ error during boot is retried for up to 120 s.
 
 - `<stateDir>/central-state/aside/<time>-<old epoch>/`, for the database and state files;
 - `<claudeHome>/.central-aside/<time>-<old epoch>/`, for Claude transcripts (`projects/`) and task
-  lists (`tasks/`).
+  lists (`tasks/`);
+- `<codexHome>/.central-aside/<time>-<old epoch>/`, for Codex rollouts (`sessions/` and
+  `archived_sessions/`).
 
 Only the two newest directories in each location are kept. Older ones, set-aside databases
 included, are deleted by later restores, so copy what you need from them soon; do not move them
@@ -402,7 +422,12 @@ Re-check these on every upstream merge. Central state relies on them without cha
   in the same file reads back.
 - `CLAUDE_CONFIG_DIR` resolution and the host session variables in
   [`ClaudeHome.ts`](../../apps/server/src/provider/Drivers/ClaudeHome.ts), and the claude-runner
-  variable names stripped in `ClaudeProcessEnvironment.ts`. New runner variables need adding there.
+  variable names stripped in `ProviderProcessEnvironment.ts`. New runner variables need adding there.
+- Codex's use of `CODEX_HOME` for an instance with no home path, in
+  [`CodexDriver.ts`](../../apps/server/src/provider/Drivers/CodexDriver.ts), and its layout:
+  `thread/resume` finds a rollout by thread id under `sessions/` or `archived_sessions/` when its
+  state database lacks the thread. A rollout missing on resume fails `thread/resume`, and
+  `ProviderTurnStartService.ts` then starts a fresh native session with the context handoff.
 - The `CentralState.supervise(config, { afterServerStop })` step in
   [`cli/server.ts`](../../apps/server/src/cli/server.ts). Settings' Reclaim runs as
   `afterServerStop`: it needs the snapshot loop's database reader closed, and its result is what

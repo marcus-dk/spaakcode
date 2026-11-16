@@ -5,7 +5,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
-import * as ClaudeProcessEnvironment from "./ClaudeProcessEnvironment.ts";
+import * as ProviderProcessEnvironment from "./ProviderProcessEnvironment.ts";
 
 const STRIPPED = [
   "CLAUDECODE",
@@ -51,6 +51,7 @@ const KEPT = [
   "CLAUDE_CODE_USE_VERTEX",
   "CLAUDE_CODE_MAX_RETRIES",
   "CLAUDE_CONFIG_DIR",
+  "CODEX_HOME",
   "HOME",
   "PATH",
 ];
@@ -58,8 +59,9 @@ const KEPT = [
 const environmentWith = (names: ReadonlyArray<string>): NodeJS.ProcessEnv =>
   Object.fromEntries(names.map((name) => [name, `value-of-${name}`]));
 
-it.layer(NodeServices.layer)("ClaudeProcessEnvironment", (it) => {
-  it("plans the T3-owned Claude home and strips only the hosting session's variables", () => {
+it.layer(NodeServices.layer)("ProviderProcessEnvironment", (it) => {
+  it("plans the T3-owned provider homes and strips only the hosting session's variables", () => {
+    const homes = { claudeHome: "/home/t3/claude", codexHome: "/home/t3/codex" };
     const rows: ReadonlyArray<{
       readonly env: NodeJS.ProcessEnv;
       readonly unset: ReadonlyArray<string>;
@@ -70,37 +72,44 @@ it.layer(NodeServices.layer)("ClaudeProcessEnvironment", (it) => {
       { env: {}, unset: [] },
     ];
     for (const row of rows) {
-      assert.deepStrictEqual(ClaudeProcessEnvironment.plan(row.env, "/home/t3/claude"), {
-        claudeHome: "/home/t3/claude",
+      assert.deepStrictEqual(ProviderProcessEnvironment.plan(row.env, homes), {
+        ...homes,
         unset: row.unset,
       });
     }
   });
 
-  it.effect("applies the plan to the provided environment and creates a private Claude home", () =>
+  it.effect("applies the plan to the provided environment and creates private provider homes", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const path = yield* Path.Path;
       const directory = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-claude-env-" });
-      const claudeHome = path.join(directory, "base", "claude");
+      const homes = {
+        claudeHome: path.join(directory, "base", "claude"),
+        codexHome: path.join(directory, "base", "codex"),
+      };
       const environment = environmentWith([
         "CLAUDE_CODE_SESSION_ID",
         "CCR_ENVIRONMENT",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
       ]);
 
-      yield* ClaudeProcessEnvironment.apply(
-        ClaudeProcessEnvironment.plan(environment, claudeHome),
+      yield* ProviderProcessEnvironment.apply(
+        ProviderProcessEnvironment.plan(environment, homes),
       ).pipe(Effect.provideService(HostProcess.Environment, environment));
 
       assert.deepStrictEqual(environment, {
         CLAUDE_CODE_OAUTH_TOKEN: "value-of-CLAUDE_CODE_OAUTH_TOKEN",
-        CLAUDE_CONFIG_DIR: claudeHome,
+        CLAUDE_CONFIG_DIR: homes.claudeHome,
+        CODEX_HOME: homes.codexHome,
       });
-      const info = yield* fileSystem.stat(claudeHome);
-      assert.strictEqual(info.type, "Directory");
-      assert.strictEqual(info.mode & 0o777, 0o700);
+      for (const home of Object.values(homes)) {
+        const info = yield* fileSystem.stat(home);
+        assert.strictEqual(info.type, "Directory");
+        assert.strictEqual(info.mode & 0o777, 0o700);
+      }
     }),
   );
 });

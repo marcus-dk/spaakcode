@@ -26,6 +26,7 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
     assert.deepStrictEqual(settings.store, { _tag: "Filesystem", root: "/tmp/x" });
     assert.strictEqual(settings.homeKey, "dev");
     assert.strictEqual(settings.claudeHome, undefined);
+    assert.strictEqual(settings.codexHome, undefined);
     assert.strictEqual(settings.generation, undefined);
     assert.strictEqual(settings.publicUrl, undefined);
     assert.isFalse(settings.takeover);
@@ -47,6 +48,7 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
       T3CODE_CENTRAL_STATE_TOKEN_FILE: "/run/token",
       T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS: "gcs",
       T3CODE_CENTRAL_STATE_CLAUDE_HOME: "/claude",
+      T3CODE_CENTRAL_STATE_CODEX_HOME: "/codex",
       T3CODE_CENTRAL_STATE_TAKEOVER: "1",
       T3CODE_CENTRAL_STATE_DEBOUNCE: "10s",
       T3CODE_CENTRAL_STATE_MAX_INTERVAL: "2m",
@@ -62,6 +64,7 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
       preconditions: "gcs",
     });
     assert.strictEqual(httpSettings.claudeHome, "/claude");
+    assert.strictEqual(httpSettings.codexHome, "/codex");
     assert.isTrue(httpSettings.takeover);
     assert.strictEqual(Duration.toMillis(httpSettings.debounce), 10_000);
     assert.strictEqual(Duration.toMillis(httpSettings.maxInterval), 120_000);
@@ -83,6 +86,7 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
       { ...enabled, T3CODE_CENTRAL_STATE_HOME_KEY: "k".repeat(129) },
       { ...enabled, T3CODE_CENTRAL_STATE_URL: "ftp://store.example/x" },
       { ...enabled, T3CODE_CENTRAL_STATE_CLAUDE_HOME: "relative/claude" },
+      { ...enabled, T3CODE_CENTRAL_STATE_CODEX_HOME: "relative/codex" },
       { ...enabled, T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS: "s3" },
       { ...enabled, T3CODE_CENTRAL_STATE_LEASE_TTL: "soon" },
       { ...enabled, T3CODE_CENTRAL_STATE_GENERATION: "0" },

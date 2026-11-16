@@ -24,22 +24,23 @@ import {
   type CentralCasLostError,
   type CentralStateCorruptObjectError,
   type CentralStateUnsupportedManifestError,
-  type ClaudeSection,
   type DatabaseRef,
   type Holder,
   type LocalMarker,
   type StateFileEntry,
-  MANIFEST_READER_VERSION,
+  type TranscriptEntry,
   Manifest,
   RETAIN_GENERATIONS,
   RETAIN_PINNED,
   casWrite,
   keys,
+  minReaderVersionFor,
   readHead,
   readJson,
   readMarker,
   writeMarker,
 } from "./Manifest.ts";
+import * as ProviderTranscripts from "./ProviderTranscripts.ts";
 import * as StateFiles from "./StateFiles.ts";
 
 export interface BundleContext {
@@ -52,6 +53,7 @@ export interface BundleContext {
     readonly dbPath: string;
     readonly attachmentsDir: string;
     readonly claudeHome: string;
+    readonly codexHome: string;
     /** <stateDir>/central-state */
     readonly workDir: string;
   };
@@ -61,11 +63,17 @@ export interface Committed {
   readonly version: string;
 }
 
-/** Implemented by ClaudeTranscripts.ts and passed in by CentralState.ts. */
-export interface ClaudeHooks {
+/** Files keyed by root directory, then by "/"-separated path under that root. */
+export type TranscriptFiles = Readonly<
+  Record<string, Readonly<Record<string, typeof TranscriptEntry.Type>>>
+>;
+
+/** Implemented by ProviderTranscripts.ts and passed in by CentralState.ts. */
+export interface TranscriptHooks {
   readonly collect: (input: {
-    readonly claudeHome: string;
-    readonly previous: typeof ClaudeSection.Type;
+    readonly home: string;
+    readonly roots: ReadonlyArray<string>;
+    readonly previous: TranscriptFiles;
     readonly upload: (input: {
       readonly path: string;
       readonly offset: number;
@@ -77,14 +85,14 @@ export interface ClaudeHooks {
       | PlatformError.PlatformError
     >;
   }) => Effect.Effect<
-    typeof ClaudeSection.Type,
+    TranscriptFiles,
     | CentralObjectStore.CentralObjectStoreError
     | CentralObjectStore.CentralObjectFencedError
     | PlatformError.PlatformError
   >;
   readonly stage: (input: {
-    readonly claudeHome: string;
-    readonly section: typeof ClaudeSection.Type;
+    readonly home: string;
+    readonly files: TranscriptFiles;
     readonly stagingDir: string;
     readonly download: (input: {
       readonly ref: typeof BlobRef.Type;
@@ -123,7 +131,7 @@ export class CentralStatePathMismatchError extends Schema.TaggedError<CentralSta
   "CentralStatePathMismatchError",
   {
     homeKey: Schema.String,
-    field: Schema.Literals(["baseDir", "stateDir", "claudeHome"]),
+    field: Schema.Literals(["baseDir", "stateDir", "claudeHome", "codexHome"]),
     recorded: Schema.String,
     current: Schema.String,
   },
@@ -223,9 +231,11 @@ const refsOf = (manifest: Manifest): ReadonlyArray<string> => [
   ...(manifest.database === null ? [] : [manifest.database.blob.sha256]),
   ...Object.values(manifest.files).map((entry) => entry.blob.sha256),
   ...[
-    ...Object.values(manifest.claude.files),
-    ...Object.values(manifest.claude.tasks ?? {}),
-  ].flatMap((entry) => entry.chunks.map((chunk) => chunk.sha256)),
+    ...Object.values(ProviderTranscripts.claude.toFiles(manifest.claude)),
+    ...Object.values(ProviderTranscripts.codex.toFiles(manifest.codex)),
+  ]
+    .flatMap((files) => Object.values(files))
+    .flatMap((entry) => entry.chunks.map((chunk) => chunk.sha256)),
 ];
 
 const monotonicMillis = Effect.map(Clock.monotonicTimeNanos, (nanos) => Number(nanos) / 1e6);
@@ -263,17 +273,21 @@ const currentPaths = (ctx: BundleContext) => ({
   baseDir: ctx.paths.baseDir,
   stateDir: ctx.paths.stateDir,
   claudeHome: ctx.paths.claudeHome,
+  codexHome: ctx.paths.codexHome,
 });
 
 const checkPaths = (ctx: BundleContext, manifest: Manifest) => {
   const current = currentPaths(ctx);
-  for (const field of ["baseDir", "stateDir", "claudeHome"] as const) {
-    if (manifest.paths[field] !== current[field]) {
+  const fields = ["baseDir", "stateDir", "claudeHome", "codexHome"] as const;
+  // Codex continuation keys hold its home path, so it matters once the home has Codex sessions.
+  for (const field of manifest.codex === undefined ? fields.slice(0, 3) : fields) {
+    const recorded = manifest.paths[field] ?? "";
+    if (recorded !== current[field]) {
       return Effect.fail(
         new CentralStatePathMismatchError({
           homeKey: ctx.homeKey,
           field,
-          recorded: manifest.paths[field],
+          recorded,
           current: current[field],
         }),
       );
@@ -334,7 +348,7 @@ const freshManifest = (
   Option.match(head, {
     onNone: () => ({
       formatVersion: 1,
-      minReaderVersion: MANIFEST_READER_VERSION,
+      minReaderVersion: 1,
       homeKey: ctx.homeKey,
       epoch: NodeCrypto.randomUUID(),
       generation: 0,
@@ -373,10 +387,24 @@ const pruneAside = Effect.fn("StateBundle.pruneAside")(function* (directory: str
   );
 });
 
+/** Each provider home with the part of `manifest` that belongs in it. */
+const providerHomes = (ctx: BundleContext, manifest: Manifest) => [
+  {
+    home: ctx.paths.claudeHome,
+    roots: ProviderTranscripts.claude.roots,
+    files: ProviderTranscripts.claude.toFiles(manifest.claude),
+  },
+  {
+    home: ctx.paths.codexHome,
+    roots: ProviderTranscripts.codex.roots,
+    files: ProviderTranscripts.codex.toFiles(manifest.codex),
+  },
+];
+
 const restore = Effect.fn("StateBundle.restore")(function* (input: {
   readonly ctx: BundleContext;
   readonly lease: HeldLease;
-  readonly claude: ClaudeHooks;
+  readonly transcripts: TranscriptHooks;
   readonly head: Committed;
   readonly database: typeof DatabaseRef.Type;
 }) {
@@ -408,10 +436,10 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
   );
 
   const staging = path.join(ctx.paths.workDir, "tmp", `restore-${NodeCrypto.randomUUID()}`);
-  const claudeStaging = path.join(
-    ctx.paths.claudeHome,
-    `.central-restore-${NodeCrypto.randomUUID()}`,
-  );
+  const homes = providerHomes(ctx, previous).map((home) => ({
+    ...home,
+    stagingDir: path.join(home.home, `.central-restore-${NodeCrypto.randomUUID()}`),
+  }));
   const download = (ref: typeof BlobRef.Type, destinationPath: string, append: boolean) =>
     Blobs.download({
       homeKey: ctx.homeKey,
@@ -455,13 +483,15 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
     }
     const now = yield* nowIso;
     yield* DatabaseSnapshot.applySequenceFloor({ path: stagedDb, floor, now });
-    const claude = yield* input.claude.stage({
-      claudeHome: ctx.paths.claudeHome,
-      section: previous.claude,
-      stagingDir: claudeStaging,
-      download: ({ ref, destinationPath, append }) =>
-        download(ref, destinationPath, append).pipe(Effect.provideContext(services)),
-    });
+    const places = yield* Effect.forEach(homes, (home) =>
+      input.transcripts.stage({
+        home: home.home,
+        files: home.files,
+        stagingDir: home.stagingDir,
+        download: ({ ref, destinationPath, append }) =>
+          download(ref, destinationPath, append).pipe(Effect.provideContext(services)),
+      }),
+    );
 
     // Nothing local moves until everything is staged and verified, and only while the lease holds.
     yield* input.lease.ensureHeld;
@@ -473,22 +503,24 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
     });
     yield* pruneAside(stateAside);
     // Transcripts and task lists of a lost lineage would carry turns the restored database lacks.
-    const claudeAside = path.join(ctx.paths.claudeHome, ".central-aside");
-    for (const directory of ["projects", "tasks"]) {
-      const current = path.join(ctx.paths.claudeHome, directory);
-      if (!(yield* fileSystem.exists(current))) continue;
-      yield* fileSystem.makeDirectory(path.join(claudeAside, name), { recursive: true });
-      yield* fileSystem.rename(current, path.join(claudeAside, name, directory));
+    for (const home of homes) {
+      const providerAside = path.join(home.home, ".central-aside");
+      for (const directory of home.roots) {
+        const current = path.join(home.home, directory);
+        if (!(yield* fileSystem.exists(current))) continue;
+        yield* fileSystem.makeDirectory(path.join(providerAside, name), { recursive: true });
+        yield* fileSystem.rename(current, path.join(providerAside, name, directory));
+      }
+      if (yield* fileSystem.exists(providerAside)) yield* pruneAside(providerAside);
     }
-    if (yield* fileSystem.exists(claudeAside)) yield* pruneAside(claudeAside);
 
     yield* StateFiles.place({ stagingDir: stagedState, stateDir: ctx.paths.stateDir, files });
-    yield* claude.place;
+    for (const { place } of places) yield* place;
     yield* DatabaseSnapshot.publish(stagedDb, ctx.paths.dbPath);
   }).pipe(
     Effect.ensuring(
       Effect.forEach(
-        [staging, claudeStaging],
+        [staging, ...homes.map(({ stagingDir }) => stagingDir)],
         (directory) => fileSystem.remove(directory, { recursive: true, force: true }),
         { discard: true },
       ).pipe(Effect.ignore),
@@ -514,7 +546,7 @@ const restore = Effect.fn("StateBundle.restore")(function* (input: {
 const prepareOnce = Effect.fn("StateBundle.prepareOnce")(function* (input: {
   readonly ctx: BundleContext;
   readonly lease: HeldLease;
-  readonly claude: ClaudeHooks;
+  readonly transcripts: TranscriptHooks;
 }) {
   const { ctx } = input;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -561,7 +593,7 @@ const prepareOnce = Effect.fn("StateBundle.prepareOnce")(function* (input: {
         committed: fenced,
         cache,
         source: { _tag: "Closed" },
-        claude: input.claude,
+        transcripts: input.transcripts,
         lease: input.lease,
       });
       const committed =
@@ -592,7 +624,7 @@ const prepareOnce = Effect.fn("StateBundle.prepareOnce")(function* (input: {
       const committed = yield* restore({
         ctx,
         lease: input.lease,
-        claude: input.claude,
+        transcripts: input.transcripts,
         head: current,
         database,
       });
@@ -604,7 +636,7 @@ const prepareOnce = Effect.fn("StateBundle.prepareOnce")(function* (input: {
 export const prepareHome = Effect.fn("StateBundle.prepareHome")(function* (input: {
   readonly ctx: BundleContext;
   readonly lease: HeldLease;
-  readonly claude: ClaudeHooks;
+  readonly transcripts: TranscriptHooks;
 }) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -755,7 +787,7 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
   readonly committed: Committed;
   readonly cache: PushCache;
   readonly source: DbSource;
-  readonly claude: ClaudeHooks;
+  readonly transcripts: TranscriptHooks;
   readonly lease: Pick<HeldLease, "remainingMs">;
 }) {
   const { ctx, cache } = input;
@@ -815,16 +847,31 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
       cache: cache.files,
       upload: (file) => upload(file),
     });
-    const claude = yield* input.claude.collect({
-      claudeHome: ctx.paths.claudeHome,
-      previous: previous.claude,
-      upload: ({ path: file, offset, length }) => upload(file, { offset, length }),
-    });
+    const collect = <Section>(
+      home: string,
+      layout: ProviderTranscripts.Layout<Section>,
+      section: Section,
+    ) =>
+      input.transcripts
+        .collect({
+          home,
+          roots: layout.roots,
+          previous: layout.toFiles(section),
+          upload: ({ path: file, offset, length }) => upload(file, { offset, length }),
+        })
+        .pipe(Effect.map(layout.fromFiles));
+    const claude = yield* collect(
+      ctx.paths.claudeHome,
+      ProviderTranscripts.claude,
+      previous.claude,
+    );
+    const codex = yield* collect(ctx.paths.codexHome, ProviderTranscripts.codex, previous.codex);
 
     if (
       Equal.equals(database, previous.database) &&
       Equal.equals(files, previous.files) &&
-      Equal.equals(claude, previous.claude)
+      Equal.equals(claude, previous.claude) &&
+      Equal.equals(codex, previous.codex)
     ) {
       if (dataVersion !== null) cache.lastPushedDataVersion = dataVersion;
       const outcome: PushOutcome = { _tag: "Unchanged" };
@@ -846,16 +893,20 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
             ...previous.pinned,
           ].slice(0, RETAIN_PINNED)
         : previous.pinned;
-    const next: Manifest = {
-      ...previous,
+    const { codex: _previousCodex, ...base } = previous;
+    const draft: Manifest = {
+      ...base,
       generation,
       holder: ctx.holder,
       committedBy: ctx.holder.holderId,
       committedAt: yield* nowIso,
       buildVersion: ctx.buildVersion,
+      // Restore checks the recorded codexHome, which manifests from before Codex sync lack.
+      paths: currentPaths(ctx),
       database,
       files,
       claude,
+      ...(codex === undefined ? {} : { codex }),
       history: [{ epoch: previous.epoch, generation }, ...previous.history].slice(
         0,
         RETAIN_GENERATIONS,
@@ -863,6 +914,7 @@ export const push = Effect.fn("StateBundle.push")(function* (input: {
       pinned,
       writeNonce: NodeCrypto.randomUUID(),
     };
+    const next: Manifest = { ...draft, minReaderVersion: minReaderVersionFor(draft) };
 
     const historyKey = keys.history(ctx.homeKey, next.epoch, generation);
     // Only a crashed, uncommitted push of this same epoch can have written this key before.

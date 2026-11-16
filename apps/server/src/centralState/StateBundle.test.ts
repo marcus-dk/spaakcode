@@ -25,9 +25,9 @@ import { runMigrations } from "../persistence/Migrations.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CentralStateFencedError, type HeldLease, type LeaseLoss } from "./CentralLease.ts";
 import * as CentralObjectStore from "./CentralObjectStore.ts";
-import * as ClaudeTranscripts from "./ClaudeTranscripts.ts";
 import { RESTORE_SEQUENCE_JUMP } from "./DatabaseSnapshot.ts";
 import * as Manifest from "./Manifest.ts";
+import * as ProviderTranscripts from "./ProviderTranscripts.ts";
 import * as SnapshotLoop from "./SnapshotLoop.ts";
 import * as StateBundle from "./StateBundle.ts";
 
@@ -37,8 +37,8 @@ const attachmentId = "thread-0a0a0a0a-0000-4000-8000-000000000001";
 const pendingId = "pending-0a0a0a0a-0000-4000-8000-000000000002";
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
-const noClaude: StateBundle.ClaudeHooks = {
-  collect: () => Effect.succeed({ files: {} }),
+const noTranscripts: StateBundle.TranscriptHooks = {
+  collect: () => Effect.succeed({}),
   stage: () => Effect.succeed({ place: Effect.void }),
 };
 
@@ -124,6 +124,7 @@ const setup = Effect.gen(function* () {
       dbPath: path.join(stateDir, "statev2.sqlite"),
       attachmentsDir: path.join(stateDir, "attachments"),
       claudeHome: path.join(root, "claude"),
+      codexHome: path.join(root, "codex"),
       workDir: path.join(stateDir, "central-state"),
     },
   });
@@ -231,7 +232,7 @@ const seedHome = (fixture: Fixture) =>
 const prepare = (
   fixture: Fixture,
   holderId: string,
-  claude = noClaude,
+  transcripts = noTranscripts,
   headSequence?: number,
   lease?: HeldLease,
 ) =>
@@ -240,7 +241,7 @@ const prepare = (
       StateBundle.prepareHome({
         ctx: fixture.context(holderId),
         lease: lease ?? (yield* makeLease(headSequence ?? null)),
-        claude,
+        transcripts,
       }),
     );
   });
@@ -258,7 +259,7 @@ const pushClosed = (
       committed,
       cache,
       source: { _tag: "Closed", dataVersion: options.dataVersion ?? null },
-      claude: noClaude,
+      transcripts: noTranscripts,
       lease: { remainingMs: Effect.succeed(options.remainingMs ?? 60_000) },
     }),
   );
@@ -434,9 +435,24 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
         yield* pushClosed(fixture, "holder-a", adopted.committed, adopted.cache),
       );
       assert.strictEqual(second.manifest.generation, 2);
+      assert.strictEqual(second.manifest.minReaderVersion, 1);
       assert.deepStrictEqual(Object.keys(second.manifest.files).sort(), [...SYNCED].sort());
       const expected = Object.fromEntries(SYNCED.map((file) => [file, fixture.read(file)]));
       const database = second.manifest.database!;
+      // A head from before Codex sync records no codexHome, and has no Codex sessions to check it for.
+      const { codexHome: _codexHome, ...legacyPaths } = second.manifest.paths;
+      yield* fixture.run(
+        fixture.store.write(
+          Manifest.keys.head(homeKey),
+          {
+            _tag: "Bytes",
+            bytes: new TextEncoder().encode(
+              JSON.stringify({ ...second.manifest, paths: legacyPaths }),
+            ),
+          },
+          { _tag: "None" },
+        ),
+      );
 
       fixture.wipe();
       const restored = yield* prepare(fixture, "holder-b");
@@ -494,33 +510,59 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
         yield* pushClosed(fixture, "holder-b", restored.committed, restored.cache),
       );
       assert.deepStrictEqual(floored.manifest.files, manifest.files);
+      assert.strictEqual(floored.manifest.paths.codexHome, fixture.context("b").paths.codexHome);
       assert.notStrictEqual(floored.manifest.database?.blob.sha256, database.blob.sha256);
       const again = yield* pushClosed(fixture, "holder-b", floored, restored.cache);
       assert.strictEqual(again._tag, "Unchanged");
     }),
   );
 
-  it.effect("restores Claude transcripts and task lists, and sets aside a lost lineage's", () =>
+  it.effect("restores Claude and Codex sessions, and sets aside a lost lineage's", () =>
     Effect.gen(function* () {
       const fixture = yield* setup;
-      const claude = yield* ClaudeTranscripts.hooks;
-      const { claudeHome } = fixture.context("a").paths;
+      const transcripts = yield* ProviderTranscripts.hooks;
+      const { claudeHome, codexHome } = fixture.context("a").paths;
       const claudeFile = (relativePath: string) => `${claudeHome}/${relativePath}`;
-      const writeClaude = (relativePath: string, contents: string) => {
-        const file = claudeFile(relativePath);
+      const codexFile = (relativePath: string) => `${codexHome}/${relativePath}`;
+      const writeAt = (file: string, contents: string) => {
         NodeFS.mkdirSync(file.slice(0, file.lastIndexOf("/")), { recursive: true });
         NodeFS.writeFileSync(file, contents);
       };
+      const writeClaude = (relativePath: string, contents: string) =>
+        writeAt(claudeFile(relativePath), contents);
+      const rollout = "2026/11/16/rollout-2026-11-16T10-00-00-thread-a.jsonl";
+      const archived = "archived_sessions/rollout-2026-11-15T10-00-00-thread-b.jsonl";
       yield* seedHome(fixture);
       writeClaude("projects/-work/session-a.jsonl", '{"type":"user"}\n');
       writeClaude("tasks/session-a/1.json", '{"id":"1","subject":"Ship it"}');
-      yield* prepare(fixture, "holder-a", claude);
+      writeAt(codexFile(`sessions/${rollout}`), '{"type":"session_meta"}\n');
+      writeAt(codexFile(archived), '{"type":"session_meta"}\n');
+      writeAt(codexFile("auth.json"), '{"tokens":"secret"}');
+      yield* prepare(fixture, "holder-a", transcripts);
+      const saved = (yield* fixture.head()).manifest;
+      assert.deepStrictEqual(Object.keys(saved.codex?.sessions ?? {}), [rollout]);
+      assert.strictEqual(saved.minReaderVersion, 2);
 
       fixture.wipe();
       writeClaude("projects/-work/stale.jsonl", '{"type":"lost"}\n');
       writeClaude("tasks/stale/1.json", "{}");
-      const restored = yield* prepare(fixture, "holder-b", claude);
+      writeAt(codexFile("sessions/2026/11/16/rollout-stale.jsonl"), '{"type":"lost"}\n');
+      const restored = yield* prepare(fixture, "holder-b", transcripts);
       assert.strictEqual(restored.mode, "restore");
+      for (const file of [`sessions/${rollout}`, archived]) {
+        assert.strictEqual(
+          NodeFS.readFileSync(codexFile(file), "utf8"),
+          '{"type":"session_meta"}\n',
+        );
+      }
+      assert.isFalse(NodeFS.existsSync(codexFile("auth.json")));
+      assert.isFalse(NodeFS.existsSync(codexFile("sessions/2026/11/16/rollout-stale.jsonl")));
+      const [codexAside] = NodeFS.readdirSync(codexFile(".central-aside"));
+      assert.isTrue(
+        NodeFS.existsSync(
+          codexFile(`.central-aside/${codexAside}/sessions/2026/11/16/rollout-stale.jsonl`),
+        ),
+      );
       assert.strictEqual(
         NodeFS.readFileSync(claudeFile("projects/-work/session-a.jsonl"), "utf8"),
         '{"type":"user"}\n',
@@ -549,7 +591,9 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
       fixture.wipe();
       const lease = yield* makeLease();
       yield* Deferred.succeed(lease.lost, "expired");
-      const error = yield* Effect.flip(prepare(fixture, "holder-b", noClaude, undefined, lease));
+      const error = yield* Effect.flip(
+        prepare(fixture, "holder-b", noTranscripts, undefined, lease),
+      );
       assert.strictEqual(error._tag, "CentralStateFencedError");
       assert.strictEqual((yield* fixture.head()).version, before.version);
     }),
@@ -586,9 +630,11 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
       });
       const lease = yield* makeLease();
       const restoring = yield* Effect.forkChild(
-        StateBundle.prepareHome({ ctx: fixture.context("holder-b"), lease, claude: noClaude }).pipe(
-          Effect.provideService(CentralObjectStore.CentralObjectStore, flaky),
-        ),
+        StateBundle.prepareHome({
+          ctx: fixture.context("holder-b"),
+          lease,
+          transcripts: noTranscripts,
+        }).pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, flaky)),
       );
       yield* Deferred.await(failed);
       yield* TestClock.adjust(Duration.seconds(1));
@@ -647,8 +693,17 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
           downloads: 0,
         })),
         {
+          error: "CentralStatePathMismatchError",
+          prepare: setHead({
+            ...good,
+            paths: { ...good.paths, codexHome: "/elsewhere" },
+            codex: { sessions: {} },
+          }),
+          downloads: 0,
+        },
+        {
           error: "CentralStateUnsupportedManifestError",
-          prepare: setHead({ ...good, minReaderVersion: 2 }),
+          prepare: setHead({ ...good, minReaderVersion: Manifest.MANIFEST_READER_VERSION + 1 }),
           downloads: 0,
         },
         {
@@ -697,8 +752,8 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
       const { dbPath, stateDir } = fixture.context("b").paths;
 
       fixture.wipe();
-      const crashing: StateBundle.ClaudeHooks = {
-        ...noClaude,
+      const crashing: StateBundle.TranscriptHooks = {
+        ...noTranscripts,
         stage: () =>
           Effect.succeed({
             place: Effect.fail(
@@ -782,7 +837,7 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
           ctx: fixture.context("holder-a"),
           committed: yield* Ref.make(adopted.committed),
           cache: adopted.cache,
-          claude: noClaude,
+          transcripts: noTranscripts,
           policy: { debounceMs: 0, minSpacingMs: 2_000, maxIntervalMs: 0, idleIntervalMs: 0 },
           finalPushTimeout: Duration.seconds(20),
           head: yield* Ref.make<number | null>(null),
@@ -804,7 +859,7 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
       yield* prepare(fixture, "holder-a");
 
       fixture.wipe();
-      const restoredB = yield* prepare(fixture, "holder-b", noClaude, 7);
+      const restoredB = yield* prepare(fixture, "holder-b", noTranscripts, 7);
       const floorB = restoredB.committed.manifest.sequenceFloor;
       assert.strictEqual(floorB, 7 + RESTORE_SEQUENCE_JUMP);
       const sequence = yield* withDatabase(
