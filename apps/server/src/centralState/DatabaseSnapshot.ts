@@ -7,6 +7,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
+import type { OrchestrationV2RunStatus } from "@t3tools/contracts";
 import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "../orchestration-v2/ProjectionStore.ts";
 import { BUILD_MIGRATION_HEAD } from "../persistence/databaseMigrationHead.ts";
 import { skippedV2Migrations } from "../persistence/Migrations.ts";
@@ -53,6 +54,8 @@ export interface LiveReader {
   readonly headSequence: Effect.Effect<number, CentralStateSnapshotError>;
   /** Changes when a session or pairing link is created, revoked, consumed or deleted. */
   readonly authMarker: Effect.Effect<string, CentralStateSnapshotError>;
+  /** True while a run is unfinished (queued and waiting on approval included) or an effect is due. */
+  readonly workPending: Effect.Effect<boolean, CentralStateSnapshotError>;
   readonly backupTo: (outPath: string) => Effect.Effect<void, CentralStateSnapshotError>;
 }
 
@@ -72,6 +75,29 @@ const AUTH_MARKER_SQL = `
     (SELECT COUNT(*) || ':' || COUNT(consumed_at) || ':' || COUNT(revoked_at) || ':' ||
             IFNULL(MAX(consumed_at), '') || ':' || IFNULL(MAX(revoked_at), '')
        FROM auth_pairing_links) AS marker
+`;
+
+// Listing the final statuses keeps a status added upstream counted as work.
+const FINAL_RUN_STATUSES = [
+  "completed",
+  "interrupted",
+  "failed",
+  "cancelled",
+  "rolled_back",
+] as const satisfies ReadonlyArray<OrchestrationV2RunStatus>;
+
+// A pending effect not yet due (a retry backoff, a scheduled resume) does not count.
+const WORK_PENDING_SQL = `
+  SELECT
+    EXISTS (
+      SELECT 1 FROM orchestration_v2_projection_runs
+      WHERE status NOT IN (${FINAL_RUN_STATUSES.map((status) => `'${status}'`).join(", ")})
+    )
+    OR EXISTS (
+      SELECT 1 FROM orchestration_v2_effect_outbox
+      WHERE status = 'running'
+         OR (status = 'pending' AND available_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    ) AS pending
 `;
 
 const hasTable = (db: NodeSqlite.DatabaseSync, name: string) =>
@@ -136,6 +162,8 @@ export const openLiveReader = Effect.fn("DatabaseSnapshot.openLiveReader")(funct
       hasTable(db, "auth_sessions") && hasTable(db, "auth_pairing_links")
         ? db.prepare(AUTH_MARKER_SQL)
         : null;
+    // Prepared on first use, so an upstream schema change fails only this read, not the snapshots.
+    let workPending: NodeSqlite.StatementSync | undefined;
     return {
       dataVersion: Effect.try({
         try: () => Number(dataVersion.get()?.data_version),
@@ -147,6 +175,10 @@ export const openLiveReader = Effect.fn("DatabaseSnapshot.openLiveReader")(funct
       }),
       authMarker: Effect.try({
         try: () => String(authMarker?.get()?.marker ?? ""),
+        catch: fail("inspect"),
+      }),
+      workPending: Effect.try({
+        try: () => Number((workPending ??= db.prepare(WORK_PENDING_SQL)).get()?.pending) === 1,
         catch: fail("inspect"),
       }),
       backupTo: (outPath) =>

@@ -65,6 +65,8 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
   readonly transcriptInterval: Duration.Duration;
   readonly finalPushTimeout: Duration.Duration;
   readonly head: Ref.Ref<number | null>;
+  /** Set each poll from LiveReader.workPending; null while the database cannot be read. */
+  readonly work: Ref.Ref<boolean | null>;
   /** True once the lease is lost; the loop then never pushes again. */
   readonly isFenced: Effect.Effect<boolean>;
   readonly lease: Pick<HeldLease, "remainingMs">;
@@ -86,6 +88,9 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
   let lastHead = initialManifest.database?.maxSequence ?? 0;
   let lastDataVersion: number | null = null;
   let lastAuthMarker: string | null = null;
+  // workPending is read again only once another connection has committed.
+  let workVersion: number | null = null;
+  let workFailing = false;
   // Read as the loop stops, after the server closed its connection: lets the final push reuse an
   // unchanged database instead of copying it again.
   let closedDataVersion: number | null = null;
@@ -164,11 +169,27 @@ export const start = Effect.fn("SnapshotLoop.start")(function* (input: {
         authMarker: live.authMarker,
       }).pipe(Effect.result);
       if (Result.isFailure(observed)) {
+        yield* Ref.set(input.work, null);
         yield* warn("Could not read the database for central state snapshots.", observed.failure);
         return true;
       }
       const { dataVersion, headSequence, authMarker } = observed.success;
       yield* Ref.set(input.head, headSequence);
+      if (dataVersion !== workVersion) {
+        const work = yield* Effect.result(live.workPending);
+        if (Result.isSuccess(work)) {
+          workVersion = dataVersion;
+          workFailing = false;
+          yield* Ref.set(input.work, work.success);
+        } else {
+          if (!workFailing) {
+            yield* warn("Could not read pending work; idle exit waits for it.", work.failure);
+          }
+          workVersion = null;
+          workFailing = true;
+          yield* Ref.set(input.work, null);
+        }
+      }
       const now = yield* monotonicMillis;
       // A revocation or a redeemed pairing link that a restore undid would work again, so auth
       // changes are pushed as promptly as history.

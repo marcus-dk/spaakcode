@@ -37,10 +37,11 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
         settings.maxInterval,
         settings.idleInterval,
         settings.transcriptInterval,
+        settings.idleExit,
         settings.leaseTtl,
         settings.finalPushTimeout,
       ].map(Duration.toMillis),
-      [10_000, 30_000, 120_000, 600_000, 2_000, 60_000, 20_000],
+      [10_000, 30_000, 120_000, 600_000, 2_000, 0, 60_000, 20_000],
     );
 
     const http = yield* read({
@@ -57,6 +58,7 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
       T3CODE_CENTRAL_STATE_GENERATION: "3",
       T3CODE_CENTRAL_STATE_PUBLIC_URL: "https://t3-s-abc.sessions.example",
       T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL: "0",
+      T3CODE_CENTRAL_STATE_IDLE_EXIT: "30m",
     });
     const httpSettings = Option.getOrThrow(Result.getOrThrow(http));
     assert.deepStrictEqual(httpSettings.store, {
@@ -74,6 +76,9 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
     assert.strictEqual(httpSettings.generation, 3);
     assert.strictEqual(httpSettings.publicUrl, "https://t3-s-abc.sessions.example");
     assert.strictEqual(Duration.toMillis(httpSettings.transcriptInterval), 0);
+    assert.strictEqual(Duration.toMillis(httpSettings.idleExit), 1_800_000);
+    const neverIdle = yield* read({ ...enabled, T3CODE_CENTRAL_STATE_IDLE_EXIT: "0" });
+    assert.isTrue(Duration.isZero(Option.getOrThrow(Result.getOrThrow(neverIdle)).idleExit));
 
     // The snapshot loop polls every 2 s, so a shorter spacing is raised to that.
     const floored = yield* read({ ...enabled, T3CODE_CENTRAL_STATE_MIN_SPACING: "500ms" });
@@ -93,6 +98,7 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
       { ...enabled, T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS: "s3" },
       { ...enabled, T3CODE_CENTRAL_STATE_LEASE_TTL: "soon" },
       { ...enabled, T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL: "soon" },
+      { ...enabled, T3CODE_CENTRAL_STATE_IDLE_EXIT: "later" },
       { ...enabled, T3CODE_CENTRAL_STATE_GENERATION: "0" },
       { ...enabled, T3CODE_CENTRAL_STATE_GENERATION: "1.5" },
       { ...enabled, T3CODE_CENTRAL_STATE_GENERATION: "next" },

@@ -3,6 +3,8 @@ import * as NodeCrypto from "node:crypto";
 
 import { SERVER_EXIT_CODE_STATE_DIR_OWNED } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -24,6 +26,7 @@ import {
   CentralStateConfigError,
   centralStateConfig,
 } from "./CentralStateConfig.ts";
+import * as IdleExit from "./IdleExit.ts";
 import * as ProviderProcessEnvironment from "./ProviderProcessEnvironment.ts";
 import * as ProviderTranscripts from "./ProviderTranscripts.ts";
 import * as SnapshotLoop from "./SnapshotLoop.ts";
@@ -50,11 +53,25 @@ export class CentralStateHandoffUnsavedError extends Schema.TaggedError<CentralS
   }
 }
 
+/** Exit code 1, so the pod's container restarts on its own disk and keeps the unsaved home. */
+export class CentralStateIdleUnsavedError extends Schema.TaggedError<CentralStateIdleUnsavedError>()(
+  "CentralStateIdleUnsavedError",
+  { homeKey: Schema.String },
+) {
+  override get message(): string {
+    return `T3 home ${this.homeKey} could not be saved when the server stopped for idleness, so it kept the lease. Changes since the last save are only on this machine; restart T3 here to keep them.`;
+  }
+}
+
+/** Ends the process like SIGTERM, with exit code 0. */
+const idleExitCause = Cause.annotate(Cause.interrupt(), Context.make(Runtime.InterruptExitCode, 0));
+
 export type CentralStateError =
   | CentralStateConfigError
   | CentralLease.CentralStateFencedError
   | CentralStateHandedOffError
   | CentralStateHandoffUnsavedError
+  | CentralStateIdleUnsavedError
   | CentralLease.CentralStateLeaseHeldError
   | StateBundle.PrepareError
   | ServerOwnership.ServerAlreadyRunningError
@@ -138,6 +155,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
     const outerScope = yield* Scope.Scope;
     const transcripts = yield* ProviderTranscripts.hooks;
     const head = yield* Ref.make<number | null>(null);
+    const work = yield* Ref.make<boolean | null>(null);
 
     // The local lock comes first, so a home in use here fails fast and restore never moves files
     // out from under a live process. The server takes the lock again once this scope closes.
@@ -178,8 +196,16 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
       transcriptInterval: settings.transcriptInterval,
       finalPushTimeout: settings.finalPushTimeout,
       head,
+      work,
       isFenced: Deferred.isDone(lease.lost),
       lease,
+    });
+    const idle = yield* IdleExit.start({
+      idleExit: settings.idleExit,
+      heartbeatPath: path.join(ctx.paths.workDir, "activity"),
+      port: config.port,
+      work: Ref.get(work),
+      homeKey: settings.homeKey,
     });
 
     const isFenced = Effect.map(
@@ -187,6 +213,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
       ([lost, fenced]) => lost || fenced,
     );
     const handoff = yield* Ref.make<{ readonly host: string; readonly pid: number } | null>(null);
+    const awaitIdle = Effect.andThen(Deferred.await(idle), Effect.failCause(idleExitCause));
     const awaitStop = Effect.raceFirst(
       Effect.flatMap(Deferred.await(lease.lost), (reason) => Effect.fail(fencedError(reason))),
       Effect.raceFirst(
@@ -221,15 +248,21 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
 
     return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
-        const exit = yield* Effect.exit(restore(Effect.raceFirst(server, awaitStop)));
+        const exit = yield* Effect.exit(
+          restore(Effect.raceFirst(server, Effect.raceFirst(awaitStop, awaitIdle))),
+        );
         const saved = yield* finalize;
+        const unsaved = !saved && !(yield* isFenced);
         const to = yield* Ref.get(handoff);
-        if (to !== null && !saved && !(yield* isFenced)) {
+        if (to !== null && unsaved) {
           return yield* new CentralStateHandoffUnsavedError({
             homeKey: settings.homeKey,
             toHost: to.host,
             toPid: to.pid,
           });
+        }
+        if (unsaved && (yield* Deferred.isDone(idle))) {
+          return yield* new CentralStateIdleUnsavedError({ homeKey: settings.homeKey });
         }
         return yield* exit;
       }),

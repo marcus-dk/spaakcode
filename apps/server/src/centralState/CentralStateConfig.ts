@@ -36,6 +36,8 @@ export interface CentralStateSettings {
   readonly idleInterval: Duration.Duration;
   /** Zero turns the transcript fast lane off. */
   readonly transcriptInterval: Duration.Duration;
+  /** How long the server may sit with no unfinished run and no client before it stops; zero never. */
+  readonly idleExit: Duration.Duration;
   readonly leaseTtl: Duration.Duration;
   readonly finalPushTimeout: Duration.Duration;
 }
@@ -60,6 +62,13 @@ const invalid = (message: string) =>
 
 const duration = (name: string, fallback: Duration.Duration) =>
   Config.schema(DurationFromString, name).pipe(Config.withDefault(fallback));
+
+const durationOrZero = (name: string, fallback: Duration.Duration) =>
+  Config.schema(DurationFromString, name).pipe(
+    // DurationFromString needs a unit, so a bare 0 is read here.
+    Config.orElse(() => Config.Literal("0", name).pipe(Config.map(() => Duration.zero))),
+    Config.withDefault(fallback),
+  );
 
 const optionalString = (name: string) =>
   Config.String(name).pipe(Config.option, Config.map(Option.getOrUndefined));
@@ -104,18 +113,11 @@ const enabledConfig = (url: string) =>
     minSpacing: duration("T3CODE_CENTRAL_STATE_MIN_SPACING", Duration.seconds(30)),
     maxInterval: duration("T3CODE_CENTRAL_STATE_MAX_INTERVAL", Duration.minutes(2)),
     idleInterval: duration("T3CODE_CENTRAL_STATE_IDLE_INTERVAL", Duration.minutes(10)),
-    transcriptInterval: Config.schema(
-      DurationFromString,
+    transcriptInterval: durationOrZero(
       "T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL",
-    ).pipe(
-      // DurationFromString needs a unit, so a bare 0 is read here.
-      Config.orElse(() =>
-        Config.Literal("0", "T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL").pipe(
-          Config.map(() => Duration.zero),
-        ),
-      ),
-      Config.withDefault(Duration.seconds(2)),
+      Duration.seconds(2),
     ),
+    idleExit: durationOrZero("T3CODE_CENTRAL_STATE_IDLE_EXIT", Duration.zero),
     leaseTtl: duration("T3CODE_CENTRAL_STATE_LEASE_TTL", Duration.seconds(60)),
     finalPushTimeout: duration("T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT", Duration.seconds(20)),
   }).pipe(

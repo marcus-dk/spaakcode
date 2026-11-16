@@ -18,6 +18,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Result from "effect/Result";
+import * as Runtime from "effect/Runtime";
 import * as Scheduler from "effect/Scheduler";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -38,7 +39,7 @@ const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
  * TestClock only waits for work the scheduler sees, so a renewal or poll still waiting on file I/O
  * would let the clock run past it. The store's lease reads and writes run synchronously here.
  */
-const synchronousFileSystem = (fs: FileSystem.FileSystem) => {
+const synchronousFileSystem = (fs: FileSystem.FileSystem, tcpTables: TcpTables) => {
   const attempt = <A>(method: string, path: string, run: () => A) =>
     Effect.try({
       try: run,
@@ -53,7 +54,12 @@ const synchronousFileSystem = (fs: FileSystem.FileSystem) => {
     });
   return FileSystem.make({
     ...fs,
-    readFile: (path) => attempt("readFile", path, () => new Uint8Array(NodeFS.readFileSync(path))),
+    readFile: (path) =>
+      attempt("readFile", path, () =>
+        path in tcpTables
+          ? new TextEncoder().encode(tcpTables[path])
+          : new Uint8Array(NodeFS.readFileSync(path)),
+      ),
     writeFile: (path, data, options) =>
       attempt("writeFile", path, () =>
         NodeFS.writeFileSync(path, data, { flag: options?.flag, mode: options?.mode }),
@@ -67,6 +73,39 @@ const synchronousFileSystem = (fs: FileSystem.FileSystem) => {
         NodeFS.mkdirSync(path, { recursive: options?.recursive, mode: options?.mode });
       }),
   });
+};
+
+/** Stands in for the kernel's socket tables, so the host's own connections never count. */
+type TcpTables = Record<string, string>;
+const TCP_HEADER =
+  "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
+const tcpTable = (port: number, connected: boolean) => {
+  const hex = port.toString(16).toUpperCase().padStart(4, "0");
+  return [
+    TCP_HEADER,
+    `   0: 00000000:${hex} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 101 1`,
+    ...(connected
+      ? [
+          `   1: 0100007F:${hex} 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 102 1`,
+        ]
+      : []),
+    "",
+  ].join("\n");
+};
+
+/** Plays a provider run in another connection, as the server's projection would record it. */
+const setRun = (config: ServerConfig.ServerConfig["Service"], status: string) => {
+  const db = new NodeSqlite.DatabaseSync(config.dbPath);
+  try {
+    db.prepare(
+      `INSERT INTO orchestration_v2_projection_runs
+         (run_id, thread_id, ordinal, provider, status, requested_at, payload_json)
+       VALUES ('run:1', 'thread:1', 1, 'claudeAgent', :status, :at, '{}')
+       ON CONFLICT (run_id) DO UPDATE SET status = excluded.status`,
+    ).run({ status, at: occurredAt });
+  } finally {
+    db.close();
+  }
 };
 
 const insertEvent = (eventId: string) =>
@@ -166,7 +205,12 @@ const setup = Effect.gen(function* () {
     yield* Layer.build(CentralObjectStore.layerFilesystem(storeRoot)),
     CentralObjectStore.CentralObjectStore,
   );
-  const fileSystem = synchronousFileSystem(fs);
+  const tcpTables: TcpTables = { "/proc/net/tcp6": `${TCP_HEADER}\n` };
+  const fileSystem = synchronousFileSystem(fs, tcpTables);
+  const setClient = (port: number, connected: boolean) => {
+    tcpTables["/proc/net/tcp"] = tcpTable(port, connected);
+  };
+  setClient(3773, false);
 
   const home = (name: string) =>
     Effect.gen(function* () {
@@ -253,7 +297,7 @@ const setup = Effect.gen(function* () {
     );
   });
 
-  return { home, wipe, supervise, lease, head, marker, supersede, fenceManifest };
+  return { home, wipe, supervise, lease, head, marker, supersede, fenceManifest, setClient };
 });
 type Fixture = Effect.Success<typeof setup>;
 
@@ -565,6 +609,65 @@ it.layer(NodeServices.layer)("CentralState.supervise", (it) => {
 
       yield* Deferred.succeed(hold.release, undefined);
       yield* Fiber.join(first);
+    }),
+  );
+
+  it.effect("stops cleanly once no run and no client has been active for the idle exit", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const config = { ...(yield* fixture.home("home")), port: 3773 };
+      const activity = `${config.stateDir}/central-state/activity`;
+      const hold = yield* makeHold;
+      const server = yield* fixture
+        .supervise(config, fakeServer(config, { write: ["event:1"], hold }), {
+          T3CODE_CENTRAL_STATE_IDLE_EXIT: "1m",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(hold.serving);
+
+      // A run waiting on approval keeps the server up past the idle exit.
+      setRun(config, "waiting");
+      yield* TestClock.adjust(Duration.minutes(2));
+      assert.isFalse(yield* Deferred.isDone(hold.interrupted));
+      setRun(config, "completed");
+
+      // So does a connected client, which also keeps the activity file fresh.
+      fixture.setClient(config.port, true);
+      yield* TestClock.adjust(Duration.seconds(50));
+      NodeFS.rmSync(activity);
+      yield* TestClock.adjust(Duration.seconds(30));
+      assert.isTrue(NodeFS.existsSync(activity));
+      assert.isFalse(yield* Deferred.isDone(hold.interrupted));
+
+      fixture.setClient(config.port, false);
+      NodeFS.rmSync(activity);
+      yield* TestClock.adjust(Duration.seconds(50));
+      assert.isFalse(yield* Deferred.isDone(hold.interrupted));
+      yield* TestClock.adjust(Duration.seconds(30));
+      const exit = yield* Fiber.await(server);
+      let exitCode: number | undefined;
+      Runtime.defaultTeardown(exit, (code) => (exitCode = code));
+      assert.strictEqual(exitCode, 0);
+      assert.isTrue(yield* Deferred.isDone(hold.interrupted));
+      assert.isFalse(NodeFS.existsSync(activity));
+      assert.isNull((yield* fixture.lease()).value.holder);
+      assert.strictEqual((yield* fixture.head()).manifest.database?.maxSequence, 1);
+    }),
+  );
+
+  it.effect("never stops an idle server without an idle exit", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const config = { ...(yield* fixture.home("home")), port: 3773 };
+      const hold = yield* makeHold;
+      const server = yield* fixture
+        .supervise(config, fakeServer(config, { write: ["event:1"], hold }))
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(hold.serving);
+      yield* TestClock.adjust(Duration.hours(1));
+      assert.isFalse(yield* Deferred.isDone(hold.interrupted));
+      yield* Deferred.succeed(hold.release, undefined);
+      yield* Fiber.join(server);
     }),
   );
 });

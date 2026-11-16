@@ -106,6 +106,7 @@ Central state is configured through environment variables only. There are no CLI
 | `T3CODE_CENTRAL_STATE_MAX_INTERVAL`        | `2m`                        | Longest a history-dirty home waits during continuous activity                                                                                                           |
 | `T3CODE_CENTRAL_STATE_IDLE_INTERVAL`       | `10m`                       | Cadence for non-history DB writes and the files-only sweep                                                                                                              |
 | `T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL` | `2s`                        | How often appended transcript and rollout lines ship between pushes. `0` turns the [fast lane](#transcript-fast-lane) off                                               |
+| `T3CODE_CENTRAL_STATE_IDLE_EXIT`           | unset, meaning never        | Stop cleanly after this long with no unfinished run and no client. See [Idle exit](#idle-exit)                                                                          |
 | `T3CODE_CENTRAL_STATE_LEASE_TTL`           | `60s`                       | Lease lifetime. The holder renews every quarter of it and stops itself after a full TTL without a renewal                                                               |
 | `T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT`  | `20s`                       | Bound on the shutdown push, which retries within it, and on the wait for a push already running at shutdown                                                             |
 
@@ -273,6 +274,38 @@ Also:
 `T3CODE_HOST_ID` keeps [usage](../user/usage.md) history on one host instead of one per pod.
 `NODE_OPTIONS` caps the heap; the pod's 16 GiB is shared with Claude Code, MCP servers and dev
 servers, and going over ends the pod.
+
+### Idle exit
+
+With `T3CODE_CENTRAL_STATE_IDLE_EXIT` set, the server stops itself once both have held for that
+long: no run is unfinished in any thread (queued, starting, running, or waiting on an approval or
+an answer) and no effect is due, and no TCP connection to the server's port is open. It logs
+
+```text
+No unfinished runs and no clients for <duration>; stopping the server (T3CODE_CENTRAL_STATE_IDLE_EXIT).
+```
+
+then stops as it does on SIGTERM: the final push, the lease release, exit code 0. If the final
+push fails it keeps the lease and exits with `CentralStateIdleUnsavedError` (exit code 1), so a
+container restart in the same pod keeps the local home. A session service can treat exit 0 as
+sleeping.
+
+- Activity is sampled every 10 s, so the stop comes up to 10 s after the interval.
+- Clients are read from the kernel's socket table (`/proc/net/tcp` and `tcp6`), because the
+  database records connects but not disconnects. Every established connection counts: browsers and
+  mobile clients, loopback connections from provider MCP calls, and keep-alive connections, which
+  the server holds for 95 s after their last request. A proxy or health check that keeps a pooled
+  connection open keeps the server up; kubelet probes do not. Clients that reach the server
+  through T3 Connect arrive on an outbound tunnel and are not seen, so turn T3 Connect off.
+- Off Linux, or with `--port 0`, clients cannot be read, and the server never stops for
+  idleness. The same holds while the database cannot be read.
+- A run stuck in an unfinished state, such as an approval nobody answers, keeps the server up.
+  A pending effect that is not yet due (a retry backoff or a resume at a usage-limit reset) does
+  not; it runs when the session next starts.
+
+Whether or not idle exit is on, the server touches `<stateDir>/central-state/activity` while it is
+busy by this definition, at most every 30 s. Its modification time tells an outside supervisor
+when the home was last in use, without reading the database. The file is not synced.
 
 ## Infra contract
 
@@ -460,6 +493,9 @@ Re-check these on every upstream merge. Central state relies on them without cha
   `thread/resume` finds a rollout by thread id under `sessions/` or `archived_sessions/` when its
   state database lacks the thread. A rollout missing on resume fails `thread/resume`, and
   `ProviderTurnStartService.ts` then starts a fresh native session with the context handoff.
+- The `orchestration_v2_projection_runs.status` final values (`OrchestrationV2RunStatus`) and the
+  `orchestration_v2_effect_outbox` status and `available_at` columns, which idle exit reads in
+  `DatabaseSnapshot.ts`. A query that stops working disables idle exit, with a warning.
 - The `CentralState.supervise(config, { afterServerStop })` step in
   [`cli/server.ts`](../../apps/server/src/cli/server.ts). Settings' Reclaim runs as
   `afterServerStop`: it needs the snapshot loop's database reader closed, and its result is what

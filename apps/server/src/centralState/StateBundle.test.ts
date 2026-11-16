@@ -1009,6 +1009,7 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
           transcriptInterval: Duration.seconds(2),
           finalPushTimeout: Duration.seconds(20),
           head: yield* Ref.make<number | null>(null),
+          work: yield* Ref.make<boolean | null>(null),
           isFenced: Effect.succeed(false),
           lease: { remainingMs: Effect.succeed(60_000) },
         }).pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, fenced));
@@ -1061,6 +1062,7 @@ it.layer(NodeServices.layer)("StateBundle", (it) => {
           transcriptInterval: Duration.seconds(2),
           finalPushTimeout: Duration.seconds(20),
           head: yield* Ref.make<number | null>(null),
+          work: yield* Ref.make<boolean | null>(null),
           isFenced: Ref.get(fenced),
           lease: { remainingMs: Effect.succeed(60_000) },
         }).pipe(Effect.provideService(CentralObjectStore.CentralObjectStore, store));
