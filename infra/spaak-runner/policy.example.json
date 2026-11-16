@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "organization": "Spaak",
+  "settings": {
+    "continueThreadsAfterServerUpdate": { "value": false, "locked": true }
+  },
+  "limits": {
+    "connect": false,
+    "webhookTasks": false,
+    "telemetry": false,
+    "updates": { "mode": "off" },
+    "providers": {
+      "allowedDrivers": ["claudeAgent", "codex"],
+      "instances": {
+        "claudeAgent": { "locked": true, "binaryPath": "/usr/local/bin/claude" },
+        "codex": { "locked": true, "binaryPath": "/usr/local/bin/codex" }
+      }
+    }
+  }
+}
