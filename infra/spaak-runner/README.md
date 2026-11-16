@@ -24,7 +24,7 @@ The session service creates one Kubernetes Job per pod, from the existing runner
   Kubernetes, replaces pods, because each replacement needs a new generation;
 - a readiness probe on `GET /.well-known/t3/environment` at port 3773. It answers once restore is done;
 - the image: the built `t3` server and web bundle, `claude` at `/usr/local/bin/claude`, `codex` at
-  `/usr/local/bin/codex`, `git`, `curl` 7.71 or later. All pods of a session must run one T3 image:
+  `/usr/local/bin/codex`, `git`, `curl` 7.71 or later, GNU `sed`. All pods of a session must run one T3 image:
   a newer one migrates the home and older ones then refuse it.
 
 The workspace checkpoint (restore before the entrypoint, checkpoint loop beside it) stays the pod
@@ -33,8 +33,10 @@ same path on every pod of a session.
 
 The entrypoint fetches the per-user environment and the Codex login, configures git, clones the repo
 if missing, then `exec`s `t3 --host 0.0.0.0 --port 3773 --no-browser <repo>`. The default command
-creates the project for the repo on first start. A background helper refreshes the token, writes the
-Codex login back and answers pairing requests. It sets `T3CODE_CENTRAL_STATE_URL`, `_HOME_KEY`,
+creates the project for the repo on first start. T3's stdout goes through `sed`, which replaces the
+token of the one-time admin pairing link that T3 prints on start, so the container log never holds a
+usable link. A background helper refreshes the token, writes the Codex login back and answers
+pairing requests; it stops once any of those calls is refused with 401 or 403. It sets `T3CODE_CENTRAL_STATE_URL`, `_HOME_KEY`,
 `_GENERATION`, `_TOKEN_FILE`, `_PUBLIC_URL`, `_IDLE_EXIT` (30 minutes unless `T3_SESSION_IDLE_EXIT`)
 and `_CODEX_HOME`; the other variables keep their defaults, see the
 [variable table](../../docs/operations/central-state.md#environment-variables). It never sets
@@ -43,19 +45,22 @@ and `_CODEX_HOME`; the other variables keep their defaults, see the
 ## Session-scoped API
 
 One base URL per session, `T3_SESSION_API` (for example `https://broker/v1/t3/sessions/<id>`). Every
-call carries `Authorization: Bearer <token>`. The token names the session, owner and generation.
-Refuse a token whose session is not the one in the path. Whether the broker or the session service
+call carries `Authorization: Bearer <token>` and `x-t3-generation: <n>`. The token names the session,
+owner and generation. Refuse a token whose session is not the one in the path. Refuse every call
+except `GET environment` and `GET codex-auth.json` with 403 and `x-t3-fenced: 1` when the header
+differs from the token's generation or is lower than the session's current one: a superseded pod
+must not write the login back or answer a pairing request with a link from its own database. Whether the broker or the session service
 answers each path is the infra owner's choice.
 
-| Method and path                     | Answer                                                                                                                                                                                                                   |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GET environment`                   | 200 with `NAME=value` lines (no quoting, one line each), or 404 for none. Lines the entrypoint skips: names that are not `[A-Za-z_][A-Za-z0-9_]*`, start with `T3CODE_`, `T3_SESSION_` or `LD_`, or are `PATH` or `HOME` |
-| `GET codex-auth.json`               | 200 with the owner's Codex `auth.json`, or 404                                                                                                                                                                           |
-| `PUT codex-auth.json`               | Store the rewritten login; 200, 201 or 204                                                                                                                                                                               |
-| `POST token`                        | 200 with a new token, only when the caller's generation is the current one; 401 or 403 otherwise                                                                                                                         |
-| `GET pairing-requests/next?wait=25` | Long poll. 200 with a request id (`[A-Za-z0-9_-]+`) as plain text, or 204 after `wait` seconds                                                                                                                           |
-| `POST pairing-requests/<id>`        | Body is the JSON of `t3 auth pairing create --json`; 204                                                                                                                                                                 |
-| `GET`/`PUT`/`DELETE objects/<key>`  | The object store, below                                                                                                                                                                                                  |
+| Method and path                     | Answer                                                                                                                                                                                                                            |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET environment`                   | 200 with `NAME=value` lines (no quoting, one line each), or 404 for none. Lines the entrypoint skips: names that are not `[A-Za-z_][A-Za-z0-9_]*`, start with `T3CODE_`, `T3_SESSION_`, `T3EP_` or `LD_`, or are `PATH` or `HOME` |
+| `GET codex-auth.json`               | 200 with the owner's Codex `auth.json`, or 404                                                                                                                                                                                    |
+| `PUT codex-auth.json`               | Store the rewritten login; 200, 201 or 204. Fenced by generation, which does not cover two live sessions of one owner (see Credentials)                                                                                           |
+| `POST token`                        | 200 with a new token, only when the caller's generation is the current one; 401 or 403 otherwise                                                                                                                                  |
+| `GET pairing-requests/next?wait=25` | Long poll. 200 with a request id (`[A-Za-z0-9_-]+`) as plain text, or 204 after `wait` seconds                                                                                                                                    |
+| `POST pairing-requests/<id>`        | Body is the JSON of `t3 auth pairing create --json`; 204                                                                                                                                                                          |
+| `GET`/`PUT`/`DELETE objects/<key>`  | The object store, below                                                                                                                                                                                                           |
 
 Tokens live at least 15 minutes; the helper refreshes every 5 (`T3_SESSION_TOKEN_REFRESH`) and
 retries on failure. T3 re-reads the token file on every request. Keep each token valid for at least
@@ -102,11 +107,14 @@ strictly as production read access.
   public URL, last activity, recent crash count.
 - **Create and wake:** raise the generation, issue a token for it, create the Job and a Service with
   a `t3` port (3773).
-- **Pod end, by container exit code:**
-  - `0`: idle exit after a final save (`T3CODE_CENTRAL_STATE_IDLE_EXIT`), or a SIGTERM that saved.
-    Mark `sleeping`.
-  - `78`: superseded (a newer generation holds the session, or the broker fenced this one) or
-    handed off. Do nothing.
+- **Pod end, by container exit code**, only for a pod whose generation (`T3_SESSION_GENERATION` on
+  its Job) is the record's current one. Ignore the end of an older pod: it may exit 1 or anything
+  else after a partition while a newer pod serves the session, and a replacement would fence that
+  pod.
+  - `0`: a final save and release, after an idle exit (`T3CODE_CENTRAL_STATE_IDLE_EXIT`) or a
+    SIGTERM. Mark `sleeping`.
+  - `78`: superseded (a newer generation holds the session, or the broker fenced this one, also
+    during the final save) or handed off. Do nothing.
   - anything else, or the pod vanished (eviction, node loss): crash. This includes exit 1 after a
     failed final save, which keeps the lease, and exit 1 after the lease expired. Start a
     replacement with the next generation; it takes the lease at once and restores the last save.
@@ -134,7 +142,9 @@ The pairing link is the only barrier.
    and posts the JSON to `POST pairing-requests/<id>`.
 3. The service redirects the owner's browser to `pairUrl` from that JSON, then discards it.
 
-Never log the JSON or the link. Expire unanswered requests after 2 minutes. A paired browser
+Never log the JSON or the link. T3 also issues a startup pairing link and prints it to stdout;
+the entrypoint redacts its token, but the link is still issued. Not issuing it when central state
+is on needs a change outside `centralState/` and is open. Expire unanswered requests after 2 minutes. A paired browser
 reconnects after a pod move with no action, because the home keeps its auth state. After a pod
 death (not a graceful stop), a revocation made in the last minutes can be undone by the restore;
 revoke again.

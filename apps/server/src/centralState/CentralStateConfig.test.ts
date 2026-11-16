@@ -55,7 +55,6 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
       T3CODE_CENTRAL_STATE_DEBOUNCE: "10s",
       T3CODE_CENTRAL_STATE_MAX_INTERVAL: "2m",
       T3CODE_CENTRAL_STATE_MIN_SPACING: "5s",
-      T3CODE_CENTRAL_STATE_GENERATION: "3",
       T3CODE_CENTRAL_STATE_PUBLIC_URL: "https://t3-s-abc.sessions.example",
       T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL: "0",
       T3CODE_CENTRAL_STATE_IDLE_EXIT: "30m",
@@ -73,7 +72,6 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
     assert.strictEqual(Duration.toMillis(httpSettings.debounce), 10_000);
     assert.strictEqual(Duration.toMillis(httpSettings.maxInterval), 120_000);
     assert.strictEqual(Duration.toMillis(httpSettings.minSpacing), 5_000);
-    assert.strictEqual(httpSettings.generation, 3);
     assert.strictEqual(httpSettings.publicUrl, "https://t3-s-abc.sessions.example");
     assert.strictEqual(Duration.toMillis(httpSettings.transcriptInterval), 0);
     assert.strictEqual(Duration.toMillis(httpSettings.idleExit), 1_800_000);
@@ -81,11 +79,21 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
     assert.isTrue(Duration.isZero(Option.getOrThrow(Result.getOrThrow(neverIdle)).idleExit));
 
     // The snapshot loop polls every 2 s, so a shorter spacing is raised to that.
-    const floored = yield* read({ ...enabled, T3CODE_CENTRAL_STATE_MIN_SPACING: "500ms" });
-    assert.strictEqual(
-      Duration.toMillis(Option.getOrThrow(Result.getOrThrow(floored)).minSpacing),
-      2_000,
-    );
+    for (const minSpacing of ["500ms", "0"]) {
+      const floored = yield* read({ ...enabled, T3CODE_CENTRAL_STATE_MIN_SPACING: minSpacing });
+      assert.strictEqual(
+        Duration.toMillis(Option.getOrThrow(Result.getOrThrow(floored)).minSpacing),
+        2_000,
+      );
+    }
+
+    const broker = {
+      T3CODE_CENTRAL_STATE_URL: "https://broker.example/v1/t3/objects",
+      T3CODE_CENTRAL_STATE_HOME_KEY: "dev",
+      T3CODE_CENTRAL_STATE_GENERATION: "3",
+    };
+    const generation = yield* read(broker);
+    assert.strictEqual(Option.getOrThrow(Result.getOrThrow(generation)).generation, 3);
 
     const rejected = [
       { T3CODE_CENTRAL_STATE_URL: "file:///tmp/x" },
@@ -99,9 +107,12 @@ it.effect("reads T3CODE_CENTRAL_STATE_* only when a URL is set", () =>
       { ...enabled, T3CODE_CENTRAL_STATE_LEASE_TTL: "soon" },
       { ...enabled, T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL: "soon" },
       { ...enabled, T3CODE_CENTRAL_STATE_IDLE_EXIT: "later" },
-      { ...enabled, T3CODE_CENTRAL_STATE_GENERATION: "0" },
-      { ...enabled, T3CODE_CENTRAL_STATE_GENERATION: "1.5" },
-      { ...enabled, T3CODE_CENTRAL_STATE_GENERATION: "next" },
+      { ...broker, T3CODE_CENTRAL_STATE_GENERATION: "0" },
+      { ...broker, T3CODE_CENTRAL_STATE_GENERATION: "1.5" },
+      { ...broker, T3CODE_CENTRAL_STATE_GENERATION: "next" },
+      // Only a broker refuses an older generation, so neither store may skip the lease wait.
+      { ...enabled, T3CODE_CENTRAL_STATE_GENERATION: "3" },
+      { ...broker, T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS: "gcs" },
     ];
     for (const env of rejected) {
       assert.isTrue(Result.isFailure(yield* read(env)), JSON.stringify(env));

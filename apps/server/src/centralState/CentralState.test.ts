@@ -11,6 +11,7 @@ import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -94,15 +95,33 @@ const tcpTable = (port: number, connected: boolean) => {
 };
 
 /** Plays a provider run in another connection, as the server's projection would record it. */
-const setRun = (config: ServerConfig.ServerConfig["Service"], status: string) => {
+const setRun = (config: ServerConfig.ServerConfig["Service"], status: string, payload = {}) => {
   const db = new NodeSqlite.DatabaseSync(config.dbPath);
   try {
     db.prepare(
       `INSERT INTO orchestration_v2_projection_runs
          (run_id, thread_id, ordinal, provider, status, requested_at, payload_json)
-       VALUES ('run:1', 'thread:1', 1, 'claudeAgent', :status, :at, '{}')
-       ON CONFLICT (run_id) DO UPDATE SET status = excluded.status`,
-    ).run({ status, at: occurredAt });
+       VALUES ('run:1', 'thread:1', 1, 'claudeAgent', :status, :at, :payload)
+       ON CONFLICT (run_id) DO UPDATE SET status = excluded.status, payload_json = excluded.payload_json`,
+    ).run({ status, at: occurredAt, payload: encodeJson(payload) });
+  } finally {
+    db.close();
+  }
+};
+
+/** Plays the provider thread a finished run leaves behind, with its background task roster. */
+const setProviderThread = (
+  config: ServerConfig.ServerConfig["Service"],
+  pendingBackgroundTasks: ReadonlyArray<unknown>,
+) => {
+  const db = new NodeSqlite.DatabaseSync(config.dbPath);
+  try {
+    db.prepare(
+      `INSERT INTO orchestration_v2_projection_provider_threads
+         (provider_thread_id, thread_id, provider, status, updated_at, payload_json)
+       VALUES ('provider-thread:1', 'thread:1', 'claudeAgent', 'idle', :at, :payload)
+       ON CONFLICT (provider_thread_id) DO UPDATE SET payload_json = excluded.payload_json`,
+    ).run({ at: occurredAt, payload: encodeJson({ pendingBackgroundTasks }) });
   } finally {
     db.close();
   }
@@ -306,6 +325,13 @@ const failureOf = <A, E>(fiber: Fiber.Fiber<A, E>) =>
     assert.isTrue(Result.isFailure(result), "expected the fiber to fail");
     return (result as Result.Failure<A, E>).failure;
   });
+
+/** What the process would exit with: runMain hands the main fiber's exit to defaultTeardown. */
+const exitCodeOf = (exit: Exit.Exit<unknown, unknown>) => {
+  let exitCode: number | undefined;
+  Runtime.defaultTeardown(exit, (code) => (exitCode = code));
+  return exitCode;
+};
 
 /** Runs a home to completion once, so the next start on it KEEPs a committed head. */
 const committedHome = (fixture: Fixture, name: string) =>
@@ -629,9 +655,16 @@ it.layer(NodeServices.layer)("CentralState.supervise", (it) => {
       setRun(config, "waiting");
       yield* TestClock.adjust(Duration.minutes(2));
       assert.isFalse(yield* Deferred.isDone(hold.interrupted));
+      // So does a background task the finished run left running, which a stop would kill.
       setRun(config, "completed");
+      setProviderThread(config, [{ taskId: "task:1" }]);
+      yield* TestClock.adjust(Duration.minutes(2));
+      assert.isFalse(yield* Deferred.isDone(hold.interrupted));
+      setProviderThread(config, []);
+      // A queue held after a failure waits for the user, so it does not.
+      setRun(config, "queued", { queueHeld: true });
 
-      // So does a connected client, which also keeps the activity file fresh.
+      // A connected client keeps it up, and also keeps the activity file fresh.
       fixture.setClient(config.port, true);
       yield* TestClock.adjust(Duration.seconds(50));
       NodeFS.rmSync(activity);
@@ -645,9 +678,7 @@ it.layer(NodeServices.layer)("CentralState.supervise", (it) => {
       assert.isFalse(yield* Deferred.isDone(hold.interrupted));
       yield* TestClock.adjust(Duration.seconds(30));
       const exit = yield* Fiber.await(server);
-      let exitCode: number | undefined;
-      Runtime.defaultTeardown(exit, (code) => (exitCode = code));
-      assert.strictEqual(exitCode, 0);
+      assert.strictEqual(exitCodeOf(exit), 0);
       assert.isTrue(yield* Deferred.isDone(hold.interrupted));
       assert.isFalse(NodeFS.existsSync(activity));
       assert.isNull((yield* fixture.lease()).value.holder);
@@ -666,8 +697,35 @@ it.layer(NodeServices.layer)("CentralState.supervise", (it) => {
       yield* Deferred.await(hold.serving);
       yield* TestClock.adjust(Duration.hours(1));
       assert.isFalse(yield* Deferred.isDone(hold.interrupted));
-      yield* Deferred.succeed(hold.release, undefined);
-      yield* Fiber.join(server);
+
+      // SIGTERM: the session service reads 0 as saved and asleep, anything else as a crash.
+      const exit = yield* Fiber.interrupt(server).pipe(Effect.andThen(Fiber.await(server)));
+      assert.strictEqual(exitCodeOf(exit), 0);
+      assert.isNull((yield* fixture.lease()).value.holder);
+    }),
+  );
+
+  it.effect("exits as superseded when the idle exit's final push finds the home fenced", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup;
+      const config = { ...(yield* committedHome(fixture, "home")), port: 3773 };
+      const hold = yield* makeHold;
+      const server = yield* fixture
+        .supervise(config, fakeServer(config, { write: [], hold }), {
+          T3CODE_CENTRAL_STATE_IDLE_EXIT: "1m",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(hold.serving);
+      // A newer generation took the home, and only the final push meets its head.
+      yield* fixture.fenceManifest;
+      setRun(config, "completed");
+
+      // Idle from the first sample that reads the run, so it stops by 70 s; the clock stops well
+      // inside the final push's timeout.
+      yield* TestClock.adjust(Duration.seconds(80));
+      const exit = yield* Fiber.await(server);
+      assert.strictEqual(exitCodeOf(exit), 78);
+      assert.isNotNull((yield* fixture.lease()).value.holder);
     }),
   );
 });

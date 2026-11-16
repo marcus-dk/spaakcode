@@ -110,7 +110,7 @@ const enabledConfig = (url: string) =>
     codexHome: optionalString("T3CODE_CENTRAL_STATE_CODEX_HOME"),
     takeover: Config.Boolean("T3CODE_CENTRAL_STATE_TAKEOVER").pipe(Config.withDefault(false)),
     debounce: duration("T3CODE_CENTRAL_STATE_DEBOUNCE", Duration.seconds(10)),
-    minSpacing: duration("T3CODE_CENTRAL_STATE_MIN_SPACING", Duration.seconds(30)),
+    minSpacing: durationOrZero("T3CODE_CENTRAL_STATE_MIN_SPACING", Duration.seconds(30)),
     maxInterval: duration("T3CODE_CENTRAL_STATE_MAX_INTERVAL", Duration.minutes(2)),
     idleInterval: duration("T3CODE_CENTRAL_STATE_IDLE_INTERVAL", Duration.minutes(10)),
     transcriptInterval: durationOrZero(
@@ -131,15 +131,19 @@ const enabledConfig = (url: string) =>
       if (rest.generation !== undefined && rest.generation < 1) {
         return invalid("T3CODE_CENTRAL_STATE_GENERATION must be a positive integer.");
       }
-      return Effect.map(
-        storeOf(url, { tokenFile, preconditions }),
-        (store): CentralStateSettings => ({
-          ...rest,
-          store,
-          claudeHome,
-          codexHome,
-          minSpacing: Duration.max(minSpacing, MIN_SPACING_FLOOR),
-        }),
+      return Effect.flatMap(storeOf(url, { tokenFile, preconditions }), (store) =>
+        // Only a broker refuses an older x-t3-generation, and the lease skips its wait on that.
+        rest.generation !== undefined && (store._tag !== "Http" || store.preconditions !== "etag")
+          ? invalid(
+              "T3CODE_CENTRAL_STATE_GENERATION needs an http(s) broker URL with etag preconditions.",
+            )
+          : Effect.succeed<CentralStateSettings>({
+              ...rest,
+              store,
+              claudeHome,
+              codexHome,
+              minSpacing: Duration.max(minSpacing, MIN_SPACING_FLOOR),
+            }),
       );
     }),
   );

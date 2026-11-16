@@ -4,10 +4,10 @@ import * as NodeCrypto from "node:crypto";
 import { SERVER_EXIT_CODE_STATE_DIR_OWNED } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Cause from "effect/Cause";
-import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
@@ -63,8 +63,20 @@ export class CentralStateIdleUnsavedError extends Schema.TaggedError<CentralStat
   }
 }
 
-/** Ends the process like SIGTERM, with exit code 0. */
-const idleExitCause = Cause.annotate(Cause.interrupt(), Context.make(Runtime.InterruptExitCode, 0));
+/**
+ * A signal's interrupt stays in the exit cause and reads as 130, so a stop that saved and released
+ * the home fails with this instead: a failure outranks the interrupt, and its code is 0.
+ */
+export class CentralStateSavedStopError extends Schema.TaggedError<CentralStateSavedStopError>()(
+  "CentralStateSavedStopError",
+  { homeKey: Schema.String },
+) {
+  override readonly [Runtime.errorExitCode] = 0;
+
+  override get message(): string {
+    return `T3 home ${this.homeKey} was saved and released as the server stopped.`;
+  }
+}
 
 export type CentralStateError =
   | CentralStateConfigError
@@ -72,6 +84,7 @@ export type CentralStateError =
   | CentralStateHandedOffError
   | CentralStateHandoffUnsavedError
   | CentralStateIdleUnsavedError
+  | CentralStateSavedStopError
   | CentralLease.CentralStateLeaseHeldError
   | StateBundle.PrepareError
   | ServerOwnership.ServerAlreadyRunningError
@@ -213,7 +226,7 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
       ([lost, fenced]) => lost || fenced,
     );
     const handoff = yield* Ref.make<{ readonly host: string; readonly pid: number } | null>(null);
-    const awaitIdle = Effect.andThen(Deferred.await(idle), Effect.failCause(idleExitCause));
+    const awaitIdle = Effect.andThen(Deferred.await(idle), Effect.failCause(Cause.interrupt()));
     const awaitStop = Effect.raceFirst(
       Effect.flatMap(Deferred.await(lease.lost), (reason) => Effect.fail(fencedError(reason))),
       Effect.raceFirst(
@@ -252,7 +265,17 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
           restore(Effect.raceFirst(server, Effect.raceFirst(awaitStop, awaitIdle))),
         );
         const saved = yield* finalize;
-        const unsaved = !saved && !(yield* isFenced);
+        // A fence found while stopping outranks why the server stopped: the session service must
+        // not mark the home sleeping, or restart it, while a newer generation serves it.
+        if (!saved && (yield* Deferred.isDone(loop.fenced))) {
+          return yield* fencedError("superseded");
+        }
+        if (!saved && (yield* Deferred.isDone(lease.lost))) {
+          return yield* Effect.flatMap(Deferred.await(lease.lost), (reason) =>
+            Effect.fail(fencedError(reason)),
+          );
+        }
+        const unsaved = !saved;
         const to = yield* Ref.get(handoff);
         if (to !== null && unsaved) {
           return yield* new CentralStateHandoffUnsavedError({
@@ -263,6 +286,9 @@ const run = Effect.fn("CentralState.supervise")(function* <A, E, R, R2>(
         }
         if (unsaved && (yield* Deferred.isDone(idle))) {
           return yield* new CentralStateIdleUnsavedError({ homeKey: settings.homeKey });
+        }
+        if (saved && Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) {
+          return yield* new CentralStateSavedStopError({ homeKey: settings.homeKey });
         }
         return yield* exit;
       }),

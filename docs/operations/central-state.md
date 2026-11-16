@@ -98,25 +98,25 @@ It does **not** carry:
 
 Central state is configured through environment variables only. There are no CLI flags.
 
-| Variable                                   | Default                     | Meaning                                                                                                                                                                 |
-| ------------------------------------------ | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `T3CODE_CENTRAL_STATE_URL`                 | unset, meaning **disabled** | `file:///abs/dir` selects the filesystem backend. `http(s)://…` selects the HTTP backend; object keys are appended to this base URL. Any other scheme is a config error |
-| `T3CODE_CENTRAL_STATE_HOME_KEY`            | required when URL is set    | The session id; one live server per key. Must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`                                                                                |
-| `T3CODE_CENTRAL_STATE_TOKEN_FILE`          | unset                       | Bearer token file, re-read on every request (HTTP only)                                                                                                                 |
-| `T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS`  | `etag`                      | `etag` (the Spaak broker, or another Bearer-token gateway) or `gcs` (GCS XML API, which uses `x-goog-generation`). S3, R2 and MinIO need SigV4 and are not supported    |
-| `T3CODE_CENTRAL_STATE_CLAUDE_HOME`         | `<baseDir>/claude`          | Absolute path. T3's Claude children use it as `CLAUDE_CONFIG_DIR`                                                                                                       |
-| `T3CODE_CENTRAL_STATE_CODEX_HOME`          | `<baseDir>/codex`           | Absolute path. T3's Codex children and terminals use it as `CODEX_HOME`                                                                                                 |
-| `T3CODE_CENTRAL_STATE_TAKEOVER`            | `false`                     | Ask a live holder to hand off instead of failing fast. Not needed with generations                                                                                      |
-| `T3CODE_CENTRAL_STATE_GENERATION`          | unset                       | Positive integer the session service gives each new pod of a session. Sent as `x-t3-generation` on every request. See [Generations](#generations)                       |
-| `T3CODE_CENTRAL_STATE_PUBLIC_URL`          | unset                       | The URL clients reach this server at. Only logged at startup, as `Serving T3 home <key> at <url>.`; pairing links are unchanged                                         |
-| `T3CODE_CENTRAL_STATE_DEBOUNCE`            | `10s`                       | Quiet time after the last history write before a push                                                                                                                   |
-| `T3CODE_CENTRAL_STATE_MIN_SPACING`         | `30s`                       | Floor on the time between push starts; values below `2s` are raised to `2s`. See [Recovery point](#recovery-point)                                                      |
-| `T3CODE_CENTRAL_STATE_MAX_INTERVAL`        | `2m`                        | Longest a history-dirty home waits during continuous activity                                                                                                           |
-| `T3CODE_CENTRAL_STATE_IDLE_INTERVAL`       | `10m`                       | Cadence for non-history DB writes and the files-only sweep                                                                                                              |
-| `T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL` | `2s`                        | How often appended transcript and rollout lines ship between pushes. `0` turns the [fast lane](#transcript-fast-lane) off                                               |
-| `T3CODE_CENTRAL_STATE_IDLE_EXIT`           | unset, meaning never        | Stop cleanly (exit 0) after this long with no unfinished run and no client. Zero or unset never stops. See [Idle exit](#idle-exit)                                      |
-| `T3CODE_CENTRAL_STATE_LEASE_TTL`           | `60s`                       | Lease lifetime. The holder renews every quarter of it and stops itself after a full TTL without a renewal                                                               |
-| `T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT`  | `20s`                       | Bound on the shutdown push, which retries within it, and on the wait for a push already running at shutdown                                                             |
+| Variable                                   | Default                     | Meaning                                                                                                                                                                                                                                        |
+| ------------------------------------------ | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `T3CODE_CENTRAL_STATE_URL`                 | unset, meaning **disabled** | `file:///abs/dir` selects the filesystem backend. `http(s)://…` selects the HTTP backend; object keys are appended to this base URL. Any other scheme is a config error                                                                        |
+| `T3CODE_CENTRAL_STATE_HOME_KEY`            | required when URL is set    | The session id; one live server per key. Must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`                                                                                                                                                       |
+| `T3CODE_CENTRAL_STATE_TOKEN_FILE`          | unset                       | Bearer token file, re-read on every request (HTTP only)                                                                                                                                                                                        |
+| `T3CODE_CENTRAL_STATE_HTTP_PRECONDITIONS`  | `etag`                      | `etag` (the Spaak broker, or another Bearer-token gateway) or `gcs` (GCS XML API, which uses `x-goog-generation`). S3, R2 and MinIO need SigV4 and are not supported                                                                           |
+| `T3CODE_CENTRAL_STATE_CLAUDE_HOME`         | `<baseDir>/claude`          | Absolute path. T3's Claude children use it as `CLAUDE_CONFIG_DIR`                                                                                                                                                                              |
+| `T3CODE_CENTRAL_STATE_CODEX_HOME`          | `<baseDir>/codex`           | Absolute path. T3's Codex children and terminals use it as `CODEX_HOME`                                                                                                                                                                        |
+| `T3CODE_CENTRAL_STATE_TAKEOVER`            | `false`                     | Ask a live holder to hand off instead of failing fast. Not needed with generations                                                                                                                                                             |
+| `T3CODE_CENTRAL_STATE_GENERATION`          | unset                       | Positive integer the session service gives each new pod of a session. Sent as `x-t3-generation` on every request. Needs an `http(s)` URL with `etag` preconditions; with any other store it is a config error. See [Generations](#generations) |
+| `T3CODE_CENTRAL_STATE_PUBLIC_URL`          | unset                       | The URL clients reach this server at. Only logged at startup, as `Serving T3 home <key> at <url>.`; pairing links are unchanged                                                                                                                |
+| `T3CODE_CENTRAL_STATE_DEBOUNCE`            | `10s`                       | Quiet time after the last history write before a push                                                                                                                                                                                          |
+| `T3CODE_CENTRAL_STATE_MIN_SPACING`         | `30s`                       | Floor on the time between push starts; values below `2s`, `0` included, are raised to `2s`. See [Recovery point](#recovery-point)                                                                                                              |
+| `T3CODE_CENTRAL_STATE_MAX_INTERVAL`        | `2m`                        | Longest a history-dirty home waits during continuous activity                                                                                                                                                                                  |
+| `T3CODE_CENTRAL_STATE_IDLE_INTERVAL`       | `10m`                       | Cadence for non-history DB writes and the files-only sweep                                                                                                                                                                                     |
+| `T3CODE_CENTRAL_STATE_TRANSCRIPT_INTERVAL` | `2s`                        | How often appended transcript and rollout lines ship between pushes. `0` turns the [fast lane](#transcript-fast-lane) off                                                                                                                      |
+| `T3CODE_CENTRAL_STATE_IDLE_EXIT`           | unset, meaning never        | Stop cleanly (exit 0) after this long with no unfinished run and no client. Zero or unset never stops. See [Idle exit](#idle-exit)                                                                                                             |
+| `T3CODE_CENTRAL_STATE_LEASE_TTL`           | `60s`                       | Lease lifetime. The holder renews every quarter of it and stops itself after a full TTL without a renewal                                                                                                                                      |
+| `T3CODE_CENTRAL_STATE_FINAL_PUSH_TIMEOUT`  | `20s`                       | Bound on the shutdown push, which retries within it, and on the wait for a push already running at shutdown                                                                                                                                    |
 
 When central state is on, T3 sets `CLAUDE_CONFIG_DIR` to the Claude home and `CODEX_HOME` to the
 Codex home before the server starts, replacing any value the runner set, and creates both with mode
@@ -246,6 +246,11 @@ generation:
 An equal generation, or none on either side, keeps the behaviour above. Older builds ignore the
 field.
 
+Skipping the wait is safe only because a broker refuses the older pod's writes, its garbage
+collection included. The filesystem store and the `gcs` dialect cannot, so
+`T3CODE_CENTRAL_STATE_GENERATION` is a config error with either. A Bearer-token gateway in the
+`etag` dialect that ignores `x-t3-generation` is not refused, and must not be given a generation.
+
 A head write that landed after it looked failed, or a push cut short at shutdown, is not a fence:
 the next push finds this server's own commit at the head, adopts it and logs `Adopted an
 unconfirmed central state commit of this server.`
@@ -282,7 +287,9 @@ and also:
 
 With `T3CODE_CENTRAL_STATE_IDLE_EXIT` set, the server stops itself once both have held for that
 long: no run is unfinished in any thread (queued, starting, running, or waiting on an approval or
-an answer) and no effect is due, and no TCP connection to the server's port is open. It logs
+an answer), no provider thread is mid-turn or holds a background task (a subagent, a background
+command or a monitor that a finished turn left running), and no effect is due; and no TCP
+connection to the server's port is open. It logs
 
 ```text
 No unfinished runs and no clients for <duration>; stopping the server (T3CODE_CENTRAL_STATE_IDLE_EXIT).
@@ -292,6 +299,11 @@ then stops as it does on SIGTERM: the final push, the lease release, exit code 0
 push fails it keeps the lease and exits with `CentralStateIdleUnsavedError` (exit code 1), so a
 container restart in the same pod keeps the local home. A session service can treat exit 0 as
 sleeping.
+
+A SIGTERM whose final push saved and released also exits 0, through `CentralStateSavedStopError`,
+which runMain logs as an error. A stop of either kind that finds the home fenced, during the final
+push or before it, exits with `CentralStateFencedError` instead: `superseded` (78) when the broker
+or the manifest refused it, `expired` (1) when the lease lapsed.
 
 - Activity is sampled every 10 s, so the stop comes up to 10 s after the interval.
 - Clients are read from the kernel's socket table (`/proc/net/tcp` and `tcp6`), because the
@@ -304,7 +316,11 @@ sleeping.
   idleness. The same holds while the database cannot be read.
 - A run stuck in an unfinished state, such as an approval nobody answers, keeps the server up.
   A pending effect that is not yet due (a retry backoff or a resume at a usage-limit reset) does
-  not; it runs when the session next starts.
+  not; it runs when the session next starts. Follow-ups queued behind a usage limit are still
+  `queued`, so they keep the server up until the reset. A queue held after a failure waits for the
+  user and does not.
+- A command running in a T3 terminal is not seen. With no client connected, idle exit stops the
+  server and the command with it.
 
 Whether or not idle exit is on, the server touches `<stateDir>/central-state/activity` while it is
 busy by this definition, at most every 30 s. Its modification time tells something inside the pod
@@ -342,8 +358,9 @@ This repo cannot provide these. The session service and broker must, as detailed
    stop, up to `finalPushTimeout` waiting for a push already running, up to `finalPushTimeout` for
    the final push and up to 15 s for the release. Set `terminationGracePeriodSeconds >= 75`.
 4. **Generations and restarts.** The session service, not Kubernetes, replaces pods, because each
-   replacement needs a higher generation. Exit 0 means idle exit, 78 means superseded or handed
-   off, anything else is a crash.
+   replacement needs a higher generation. Exit 0 means saved and stopped (idle exit or SIGTERM), 78
+   means superseded or handed off, anything else is a crash. Act only on the exit of the pod whose
+   generation is the session's current one; a stale pod's exit says nothing about the live one.
 5. **Port and route.** Add a `t3` port to the per-session Service and a `t3-` host prefix to the
    router, one stable host per session. The route must pass WebSockets, keep `Host`, set
    `X-Forwarded-Proto=https`, and do no HTTP-level SSO, which breaks CORS, mobile and peer links.

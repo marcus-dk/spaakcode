@@ -86,17 +86,27 @@ const FINAL_RUN_STATUSES = [
   "rolled_back",
 ] as const satisfies ReadonlyArray<OrchestrationV2RunStatus>;
 
-// A pending effect not yet due (a retry backoff, a scheduled resume) does not count.
+// A pending effect not yet due (a retry backoff, a scheduled resume) does not count, nor does a
+// held queue, which waits for the user. A provider thread counts as runtime recovery reads it: a
+// finished run can leave background tasks running, and stopping the server kills them.
 const WORK_PENDING_SQL = `
   SELECT
     EXISTS (
       SELECT 1 FROM orchestration_v2_projection_runs
       WHERE status NOT IN (${FINAL_RUN_STATUSES.map((status) => `'${status}'`).join(", ")})
+        AND NOT (status = 'queued' AND CASE WHEN json_valid(payload_json)
+          THEN json_extract(payload_json, '$.queueHeld') IS 1 ELSE 0 END)
     )
     OR EXISTS (
       SELECT 1 FROM orchestration_v2_effect_outbox
       WHERE status = 'running'
          OR (status = 'pending' AND available_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    )
+    OR EXISTS (
+      SELECT 1 FROM orchestration_v2_projection_provider_threads
+      WHERE status = 'active'
+         OR CASE WHEN json_valid(payload_json)
+           THEN json_array_length(payload_json, '$.pendingBackgroundTasks') > 0 ELSE 0 END
     ) AS pending
 `;
 
